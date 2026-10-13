@@ -1,13 +1,13 @@
 // Package config loads and validates the externalized configuration of the
-// NexaU Cloud API. Every tunable that affects production behavior lives here;
+// MASh Cloud API. Every tunable that affects production behavior lives here;
 // secrets are never defaulted to real values and never committed.
 package config
 
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -21,15 +21,14 @@ type Config struct {
 	ShutdownGrace     time.Duration // NEXAU_SHUTDOWN_GRACE (default 30s)
 	MaxHeaderBytes    int           // NEXAU_MAX_HEADER_BYTES (default 16KB)
 	MaxConcurrentReqs int           // in-flight requests bound (default 8192)
-	AllowedOrigins    []string      // CORS / WS origin allow-list (default none)
+	AllowedOrigins    []string      // CORS origin allow-list (default none)
 	TrustProxyHeaders bool          // honor X-Forwarded-For (default true)
 
 	// Request limits
-	MaxBodyBytes      int64 // NEXAU_MAX_BODY_BYTES (default 2 MiB)
-	MaxMessages       int   // default 256
-	MaxTools          int   // default 128
-	MaxModelLen       int   // default 256
-	MaxGenerateParams int   // number of allowed generation params
+	MaxBodyBytes int64 // NEXAU_MAX_BODY_BYTES (default 2 MiB)
+	MaxMessages  int   // default 256
+	MaxTools     int   // default 128
+	MaxModelLen  int   // default 256
 
 	// Timeouts (separate concepts, never one global)
 	WriteTimeout       time.Duration // HTTP write timeout (0 = none; streams manage own)
@@ -38,27 +37,19 @@ type Config struct {
 	AuthTimeout        time.Duration // auth verification budget (default 3s)
 	DBTimeout          time.Duration // single statement budget (default 5s)
 	RedisTimeout       time.Duration // single command budget (default 500ms)
-	StreamIdleTimeout  time.Duration // no upstream chunk → abort (default 300s, NexAU parity)
+	StreamIdleTimeout  time.Duration // no upstream chunk → abort (default 300s, Bifrost parity)
 	StreamMaxDuration  time.Duration // hard cap of one stream (default 15m)
 	BifrostDialTimeout time.Duration // default 10s
 	BifrostTLSTimeout  time.Duration // default 10s
 	BifrostHeaderTO    time.Duration // response header wait (default 60s)
-	BifrostReqTimeout  time.Duration // non-stream request cap (default 120s)
+	BifrostReqTimeout  time.Duration // non-stream LLM call cap (default 120s)
 
-	// WebSocket
-	WSHeartbeatInterval time.Duration // server ping period (default 15s)
-	WSWriteWait         time.Duration // per-frame write deadline (default 10s)
-	WSMaxMessageSize    int64         // client frame cap (default 512 KiB)
-	WSSendQueue         int           // per-connection outbound queue (default 512)
-	WSSlowConsumerGrace time.Duration // drain grace before eviction (default 5s)
-	WSIdleTimeout       time.Duration // no frames at all → close (default 10m)
-	WSAllowQueryToken   bool          // opt-in: accept ?access_token= (default false)
+	// SSE stream transport
+	StreamWriteDeadline     time.Duration // per-event client write deadline (default 10s)
+	StreamHeartbeatInterval time.Duration // SSE comment keepalive period (default 15s)
 
-	// Authentication
+	// Authentication (Google OAuth only; tokens minted locally)
 	Auth AuthConfig
-
-	// Mail (transactional: verification + password reset)
-	Mail MailConfig
 
 	// Payments (prepaid credit top-ups via Razorpay; docs/PAYMENT-GATEWAY.md)
 	Payments PaymentConfig
@@ -80,57 +71,33 @@ type Config struct {
 	// Rate limiting
 	Rate RateLimitConfig
 
-	// Streaming / replay
-	Replay ReplayConfig
-
 	// Metering
 	Meter MeterConfig
 
-	// Idempotency
-	IdempotencyTTL time.Duration // default 24h
+	// Token accounting (normalization weights cache TTL; the weights
+	// themselves live in the token_normalization table).
+	NormCacheTTL time.Duration // default 30s
 
 	// Observability
 	Log  LogConfig
 	OTel OTelConfig
-
-	// Sessions
-	SessionIdleTTL time.Duration // default 24h
 }
 
-// AuthConfig controls token verification and issuance.
+// AuthConfig controls token issuance/verification and the Google OAuth +
+// web-to-desktop handshake.
 type AuthConfig struct {
-	Mode            string // "jwks" (external IdP) | "local" (HS256 issued here)
-	JWKSURL         string
-	JWKSRefresh     time.Duration // key set refresh interval (default 1h)
-	JWKSMinRefresh  time.Duration // min refresh on unknown kid (default 1m)
-	Issuer          string        // expected `iss` (default https://auth.nexau.cloud)
-	Audience        string        // expected `aud` (default nexau-cloud-api)
-	HS256Secret     string        // local mode only; ≥32 bytes enforced
+	Issuer          string        // expected `iss` (default https://auth.mash.cloud)
+	Audience        string        // expected `aud` (default mash-cloud-api)
+	HS256Secret     string        // ≥32 bytes enforced
 	HS256SecretFile string        // optional path; takes precedence (secret-manager friendly)
 	AccessTokenTTL  time.Duration // default 15m
 	RefreshTokenTTL time.Duration // default 30d
 	DeviceTokenTTL  time.Duration // default 100d
 	Leeway          time.Duration // clock skew tolerance (default 30s)
 	RevocationCheck bool          // check jti blacklist in Redis (default true)
-	LoginEnabled    bool          // expose POST /v1/auth/login (local mode, default true)
-	// MaxFailedLoginsPerIP limits login attempts per source IP per window (default 30/15m)
-	MaxFailedLoginsPerIP int
-	// UnverifiedRetention: unverified local accounts are purged (with their
-	// personal tenant) after this age — closes the pre-hijacking seeding
-	// window (2026-09-19 audit, finding 3). Default 72h.
-	UnverifiedRetention time.Duration
-
-	// Signup & account recovery (local mode only; all endpoints unmounted in jwks mode).
-	SignupEnabled     bool          // expose register/verify/recovery endpoints (default true)
-	RequireVerified   bool          // login gate: unverified accounts cannot sign in (default true)
-	VerifyTokenTTL    time.Duration // email verification token lifetime (default 24h)
-	ResetTokenTTL     time.Duration // password reset token lifetime (default 30m)
-	ResendCooldown    time.Duration // per (purpose,email) send cooldown (default 60s)
-	MinPasswordLength int           // default 8 (NIST 800-63B floor)
-	AppBaseURL        string        // website origin for emailed links, e.g. https://app.nexau.cloud
 
 	// Google OAuth 2.0 / OIDC ("Continue with Google" on the web login).
-	// Enabled iff ClientID+Secret+RedirectURL are all set and Mode=local.
+	// Enabled iff ClientID+Secret+RedirectURL are all set.
 	GoogleClientID     string
 	GoogleClientSecret string
 	GoogleRedirectURL  string // registered in Google Cloud Console, exact match
@@ -150,30 +117,11 @@ type AuthConfig struct {
 	OAuthCookieSecure bool          // Secure attribute on the OAuth tx cookie (default true)
 
 	// Handshake throttle budgets (15-minute per-IP windows except where noted).
-	MaxLookupPerIP          int // POST /v1/auth/lookup (enumeration surface, default 60)
 	MaxWebSessionPerIP      int // POST /v1/auth/web/session (default 60)
 	MaxDesktopExchangePerIP int // POST /v1/auth/desktop/exchange (default 60)
 	MaxDesktopCodePerMin    int // POST /v1/auth/desktop/code per user per minute (default 30)
-
-	// Previously-unthrottled unauthenticated surfaces (2026-09-19 audit,
-	// cluster A — every one of them does PG/Redis work per request):
-	MaxRefreshPerIP int // POST /v1/auth/refresh (rotation + PG writes, default 60)
-	MaxOAuthPerIP   int // GET  /v1/auth/oauth/google{,/callback} (Redis state, default 60)
-}
-
-// MailConfig selects the transactional-mail backend.
-type MailConfig struct {
-	Mode     string // "log" (default — metadata-only events in the log) | "smtp"
-	From     string // envelope sender, e.g. NexaU <no-reply@nexau.cloud>
-	Host     string
-	Port     int // default 587
-	Username string
-	Password string
-	SSL      bool // true = implicit TLS (465); false = mandatory STARTTLS (587)
-	// LogLinks re-enables DEVELOPMENT-ONLY link logging in log mode
-	// (2026-09-19 audit, finding 2: a reset link is a login credential;
-	// it never appears in logs unless explicitly requested). Default false.
-	LogLinks bool
+	MaxRefreshPerIP         int // POST /v1/auth/refresh (rotation + PG writes, default 60)
+	MaxOAuthPerIP           int // GET  /v1/auth/oauth/google{,/callback} (Redis state, default 60)
 }
 
 // BifrostConfig is the upstream gateway connection.
@@ -208,21 +156,13 @@ type BifrostConfig struct {
 // RateLimitConfig holds distributed limiter dimensions. Zero value of a limit
 // disables that dimension.
 type RateLimitConfig struct {
-	RequestsPerMinuteUser   int64         // default 600
-	RequestsPerMinuteTenant int64         // default 6000
-	ConcurrentRunsUser      int64         // default 16
-	ConcurrentRunsTenant    int64         // default 256
-	WSConnectionsPerUser    int64         // default 8
-	IPRequestsPerMinute     int64         // default 1200 (auth + create endpoints)
-	FailOpen                bool          // default true (availability with alarm)
-	RunConcurrencyTimeout   time.Duration // how long a stale concurrent slot self-expires (default 30m)
-}
-
-// ReplayConfig bounds the resumable event buffer.
-type ReplayConfig struct {
-	MaxEventsPerRun int           // Redis Stream MAXLEN (default 2048)
-	Window          time.Duration // TTL of a run's event buffer (default 15m)
-	MaxReplayBytes  int64         // cap a single replay response (default 8 MiB)
+	RequestsPerMinuteUser    int64         // default 600
+	RequestsPerMinuteTenant  int64         // default 6000
+	ConcurrentRequestsUser   int64         // default 16
+	ConcurrentRequestsTenant int64         // default 256
+	IPRequestsPerMinute      int64         // default 1200 (auth + create endpoints)
+	FailOpen                 bool          // default true (availability with alarm)
+	SlotTimeout              time.Duration // how long a stale concurrent slot self-expires (default 30m)
 }
 
 // MeterConfig bounds the async usage recorder.
@@ -242,14 +182,27 @@ type LogConfig struct {
 
 // PaymentConfig wires the payment gateway module.
 type PaymentConfig struct {
-	Provider string // disabled | mock | razorpay
+	Provider string // disabled | mock | razorpay | stripe | phonepe
 
 	RazorpayKeyID         string
 	RazorpayKeySecret     string
 	RazorpayWebhookSecret string
 	RazorpayAPIBase       string // "" → razorpay.DefaultBaseURL
 
-	// CatalogJSON optionally overrides the built-in credit packs.
+	StripeAPIKey         string // sk_… / rk_…
+	StripePublishableKey string // pk_… (relayed to clients as key_id)
+	StripeWebhookSecret  string // whsec_…
+	StripeAPIBase        string // "" → stripe.DefaultBaseURL
+
+	PhonepeMerchantID   string // MERCHANTUAT (test) / production id
+	PhonepeSaltKey      string // server secret
+	PhonepeSaltIndex    string // "1" (selects the active dashboard key)
+	PhonepeRedirectURL  string // frontend return page (absolute URL)
+	PhonepeRedirectMode string // POST | REDIRECT
+	PhonepeCallbackURL  string // public API base + /v1/payments/webhook
+	PhonepeAPIBase      string // "" → phonepe.DefaultBaseURL (preprod override)
+
+	// CatalogJSON optionally overrides the built-in plan SKUs.
 	CatalogJSON string
 
 	// MockAutoCapture: in mock mode, provider orders capture themselves
@@ -292,63 +245,41 @@ func Load() (*Config, error) {
 		MaxTools:     envInt("NEXAU_MAX_TOOLS", 128),
 		MaxModelLen:  envInt("NEXAU_MAX_MODEL_LEN", 256),
 
-		ReadHeaderTimeout:  envDur("NEXAU_READ_HEADER_TIMEOUT", 10*time.Second),
-		IdleTimeout:        envDur("NEXAU_IDLE_TIMEOUT", 120*time.Second),
-		AuthTimeout:        envDur("NEXAU_AUTH_TIMEOUT", 3*time.Second),
-		DBTimeout:          envDur("NEXAU_DB_TIMEOUT", 5*time.Second),
-		RedisTimeout:       envDur("NEXAU_REDIS_TIMEOUT", 500*time.Millisecond),
-		StreamIdleTimeout:  envDur("NEXAU_STREAM_IDLE_TIMEOUT", 300*time.Second),
-		StreamMaxDuration:  envDur("NEXAU_STREAM_MAX_DURATION", 15*time.Minute),
-		BifrostDialTimeout: envDur("NEXAU_BIFROST_DIAL_TIMEOUT", 10*time.Second),
-		BifrostTLSTimeout:  envDur("NEXAU_BIFROST_TLS_TIMEOUT", 10*time.Second),
-		BifrostHeaderTO:    envDur("NEXAU_BIFROST_HEADER_TIMEOUT", 60*time.Second),
-		BifrostReqTimeout:  envDur("NEXAU_BIFROST_REQUEST_TIMEOUT", 120*time.Second),
+		ReadHeaderTimeout:       envDur("NEXAU_READ_HEADER_TIMEOUT", 10*time.Second),
+		IdleTimeout:             envDur("NEXAU_IDLE_TIMEOUT", 120*time.Second),
+		AuthTimeout:             envDur("NEXAU_AUTH_TIMEOUT", 3*time.Second),
+		DBTimeout:               envDur("NEXAU_DB_TIMEOUT", 5*time.Second),
+		RedisTimeout:            envDur("NEXAU_REDIS_TIMEOUT", 500*time.Millisecond),
+		StreamIdleTimeout:       envDur("NEXAU_STREAM_IDLE_TIMEOUT", 300*time.Second),
+		StreamMaxDuration:       envDur("NEXAU_STREAM_MAX_DURATION", 15*time.Minute),
+		BifrostDialTimeout:      envDur("NEXAU_BIFROST_DIAL_TIMEOUT", 10*time.Second),
+		BifrostTLSTimeout:       envDur("NEXAU_BIFROST_TLS_TIMEOUT", 10*time.Second),
+		BifrostHeaderTO:         envDur("NEXAU_BIFROST_HEADER_TIMEOUT", 60*time.Second),
+		BifrostReqTimeout:       envDur("NEXAU_BIFROST_REQUEST_TIMEOUT", 120*time.Second),
+		StreamWriteDeadline:     envDur("NEXAU_STREAM_WRITE_DEADLINE", 10*time.Second),
+		StreamHeartbeatInterval: envDur("NEXAU_STREAM_HEARTBEAT_INTERVAL", 15*time.Second),
 
-		WSHeartbeatInterval: envDur("NEXAU_WS_HEARTBEAT_INTERVAL", 15*time.Second),
-		WSWriteWait:         envDur("NEXAU_WS_WRITE_WAIT", 10*time.Second),
-		WSMaxMessageSize:    envInt64("NEXAU_WS_MAX_MESSAGE_SIZE", 512<<10),
-		WSSendQueue:         envInt("NEXAU_WS_SEND_QUEUE", 512),
-		WSSlowConsumerGrace: envDur("NEXAU_WS_SLOW_CONSUMER_GRACE", 5*time.Second),
-		WSIdleTimeout:       envDur("NEXAU_WS_IDLE_TIMEOUT", 10*time.Minute),
-		WSAllowQueryToken:   envBool("NEXAU_WS_ALLOW_QUERY_TOKEN", false),
-
-		DatabaseURL:    os.Getenv("NEXAU_DATABASE_URL"),
-		RedisURL:       os.Getenv("NEXAU_REDIS_URL"),
-		IdempotencyTTL: envDur("NEXAU_IDEMPOTENCY_TTL", 24*time.Hour),
-		SessionIdleTTL: envDur("NEXAU_SESSION_IDLE_TTL", 24*time.Hour),
-
+		DatabaseURL:       os.Getenv("NEXAU_DATABASE_URL"),
+		RedisURL:          os.Getenv("NEXAU_REDIS_URL"),
 		DBMaxConnLifetime: envDur("NEXAU_DB_CONN_LIFETIME", 30*time.Minute),
 		DBHealthTimeout:   envDur("NEXAU_DB_HEALTH_TIMEOUT", 2*time.Second),
 	}
 
-	cpus := runtimeCPUs()
+	cpus := runtimeNumCPU()
 	c.DBMaxConns = int32(envInt("NEXAU_DB_MAX_CONNS", max(8, 4*cpus)))
 	c.DBMinConns = int32(envInt("NEXAU_DB_MIN_CONNS", 4))
 	c.RedisPoolSize = max(8, 4*cpus)
 
 	// Auth
 	c.Auth = AuthConfig{
-		Mode:                 strings.ToLower(envStr("NEXAU_AUTH_MODE", "local")),
-		JWKSURL:              os.Getenv("NEXAU_AUTH_JWKS_URL"),
-		JWKSRefresh:          envDur("NEXAU_AUTH_JWKS_REFRESH", time.Hour),
-		JWKSMinRefresh:       envDur("NEXAU_AUTH_JWKS_MIN_REFRESH", time.Minute),
-		Issuer:               envStr("NEXAU_AUTH_ISSUER", "https://auth.nexau.cloud"),
-		Audience:             envStr("NEXAU_AUTH_AUDIENCE", "nexau-cloud-api"),
-		HS256Secret:          os.Getenv("NEXAU_AUTH_HS256_SECRET"),
-		AccessTokenTTL:       envDur("NEXAU_AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
-		RefreshTokenTTL:      envDur("NEXAU_AUTH_REFRESH_TOKEN_TTL", 30*24*time.Hour),
-		DeviceTokenTTL:       envDur("NEXAU_AUTH_DEVICE_TOKEN_TTL", 100*24*time.Hour),
-		Leeway:               envDur("NEXAU_AUTH_LEEWAY", 30*time.Second),
-		RevocationCheck:      envBool("NEXAU_AUTH_REVOCATION_CHECK", true),
-		LoginEnabled:         envBool("NEXAU_AUTH_LOGIN_ENABLED", true),
-		MaxFailedLoginsPerIP: envInt("NEXAU_AUTH_MAX_FAILED_LOGINS_PER_IP", 30),
-		SignupEnabled:        envBool("NEXAU_AUTH_SIGNUP_ENABLED", true),
-		RequireVerified:      envBool("NEXAU_AUTH_REQUIRE_VERIFIED", true),
-		VerifyTokenTTL:       envDur("NEXAU_AUTH_VERIFY_TOKEN_TTL", 24*time.Hour),
-		ResetTokenTTL:        envDur("NEXAU_AUTH_RESET_TOKEN_TTL", 30*time.Minute),
-		ResendCooldown:       envDur("NEXAU_AUTH_RESEND_COOLDOWN", time.Minute),
-		MinPasswordLength:    envInt("NEXAU_AUTH_MIN_PASSWORD_LENGTH", 8),
-		AppBaseURL:           strings.TrimRight(os.Getenv("NEXAU_APP_BASE_URL"), "/"),
+		Issuer:          envStr("NEXAU_AUTH_ISSUER", "https://auth.mash.cloud"),
+		Audience:        envStr("NEXAU_AUTH_AUDIENCE", "mash-cloud-api"),
+		HS256Secret:     os.Getenv("NEXAU_AUTH_HS256_SECRET"),
+		AccessTokenTTL:  envDur("NEXAU_AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
+		RefreshTokenTTL: envDur("NEXAU_AUTH_REFRESH_TOKEN_TTL", 30*24*time.Hour),
+		DeviceTokenTTL:  envDur("NEXAU_AUTH_DEVICE_TOKEN_TTL", 100*24*time.Hour),
+		Leeway:          envDur("NEXAU_AUTH_LEEWAY", 30*time.Second),
+		RevocationCheck: envBool("NEXAU_AUTH_REVOCATION_CHECK", true),
 
 		GoogleClientID:     os.Getenv("NEXAU_AUTH_GOOGLE_CLIENT_ID"),
 		GoogleClientSecret: os.Getenv("NEXAU_AUTH_GOOGLE_CLIENT_SECRET"),
@@ -365,15 +296,11 @@ func Load() (*Config, error) {
 		DesktopCodeTTL:    envDur("NEXAU_AUTH_DESKTOP_CODE_TTL", 60*time.Second),
 		OAuthCookieSecure: envBool("NEXAU_AUTH_OAUTH_COOKIE_SECURE", true),
 
-		MaxLookupPerIP:          envInt("NEXAU_AUTH_LOOKUP_PER_IP", 60),
 		MaxWebSessionPerIP:      envInt("NEXAU_AUTH_WEB_SESSION_PER_IP", 60),
 		MaxDesktopExchangePerIP: envInt("NEXAU_AUTH_DESKTOP_EXCHANGE_PER_IP", 60),
 		MaxDesktopCodePerMin:    envInt("NEXAU_AUTH_DESKTOP_CODE_PER_MIN", 30),
-
-		MaxRefreshPerIP: envInt("NEXAU_AUTH_REFRESH_PER_IP", 60),
-		MaxOAuthPerIP:   envInt("NEXAU_AUTH_OAUTH_PER_IP", 60),
-
-		UnverifiedRetention: envDur("NEXAU_AUTH_UNVERIFIED_RETENTION", 72*time.Hour),
+		MaxRefreshPerIP:         envInt("NEXAU_AUTH_REFRESH_PER_IP", 60),
+		MaxOAuthPerIP:           envInt("NEXAU_AUTH_OAUTH_PER_IP", 60),
 	}
 
 	// Secret-file override for the HS256 key (mirrors BIFROST_API_KEY_FILE):
@@ -388,18 +315,6 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// Mail
-	c.Mail = MailConfig{
-		Mode:     strings.ToLower(envStr("NEXAU_MAIL_MODE", "log")),
-		From:     os.Getenv("NEXAU_MAIL_FROM"),
-		Host:     os.Getenv("NEXAU_SMTP_HOST"),
-		Port:     envInt("NEXAU_SMTP_PORT", 587),
-		Username: os.Getenv("NEXAU_SMTP_USERNAME"),
-		Password: os.Getenv("NEXAU_SMTP_PASSWORD"),
-		SSL:      envBool("NEXAU_SMTP_SSL", false),
-		LogLinks: envBool("NEXAU_MAIL_LOG_LINKS", false),
-	}
-
 	// Payments (docs/PAYMENT-GATEWAY.md §11 — env key reference)
 	c.Payments = PaymentConfig{
 		Provider:              strings.ToLower(envStr("NEXAU_PAYMENT_PROVIDER", "disabled")),
@@ -407,6 +322,17 @@ func Load() (*Config, error) {
 		RazorpayKeySecret:     os.Getenv("NEXAU_RAZORPAY_KEY_SECRET"),
 		RazorpayWebhookSecret: os.Getenv("NEXAU_RAZORPAY_WEBHOOK_SECRET"),
 		RazorpayAPIBase:       strings.TrimRight(os.Getenv("NEXAU_RAZORPAY_API_BASE"), "/"),
+		StripeAPIKey:          strings.TrimSpace(os.Getenv("NEXAU_STRIPE_API_KEY")),
+		StripePublishableKey:  strings.TrimSpace(os.Getenv("NEXAU_STRIPE_PUBLISHABLE_KEY")),
+		StripeWebhookSecret:   strings.TrimSpace(os.Getenv("NEXAU_STRIPE_WEBHOOK_SECRET")),
+		StripeAPIBase:         strings.TrimRight(os.Getenv("NEXAU_STRIPE_API_BASE"), "/"),
+		PhonepeMerchantID:     strings.TrimSpace(os.Getenv("NEXAU_PHONEPE_MERCHANT_ID")),
+		PhonepeSaltKey:        strings.TrimSpace(os.Getenv("NEXAU_PHONEPE_SALT_KEY")),
+		PhonepeSaltIndex:      envStr("NEXAU_PHONEPE_SALT_INDEX", "1"),
+		PhonepeRedirectURL:    strings.TrimSpace(os.Getenv("NEXAU_PHONEPE_REDIRECT_URL")),
+		PhonepeRedirectMode:   strings.ToUpper(envStr("NEXAU_PHONEPE_REDIRECT_MODE", "POST")),
+		PhonepeCallbackURL:    strings.TrimSpace(os.Getenv("NEXAU_PHONEPE_CALLBACK_URL")),
+		PhonepeAPIBase:        strings.TrimRight(os.Getenv("NEXAU_PHONEPE_API_BASE"), "/"),
 		CatalogJSON:           os.Getenv("NEXAU_PAYMENT_CATALOG_JSON"),
 		OrderTTL:              envDur("NEXAU_PAYMENT_ORDER_TTL", 15*time.Minute),
 		SweepInterval:         envDur("NEXAU_PAYMENT_SWEEP_INTERVAL", time.Minute),
@@ -455,21 +381,13 @@ func Load() (*Config, error) {
 
 	// Rate limits
 	c.Rate = RateLimitConfig{
-		RequestsPerMinuteUser:   envInt64("NEXAU_RATE_REQ_PER_MIN_USER", 600),
-		RequestsPerMinuteTenant: envInt64("NEXAU_RATE_REQ_PER_MIN_TENANT", 6000),
-		ConcurrentRunsUser:      envInt64("NEXAU_RATE_CONCURRENT_RUNS_USER", 16),
-		ConcurrentRunsTenant:    envInt64("NEXAU_RATE_CONCURRENT_RUNS_TENANT", 256),
-		WSConnectionsPerUser:    envInt64("NEXAU_RATE_WS_CONNS_PER_USER", 8),
-		IPRequestsPerMinute:     envInt64("NEXAU_RATE_REQ_PER_MIN_IP", 1200),
-		FailOpen:                envBool("NEXAU_RATE_FAIL_OPEN", true),
-		RunConcurrencyTimeout:   envDur("NEXAU_RATE_RUN_CONCURRENCY_TIMEOUT", 30*time.Minute),
-	}
-
-	// Replay
-	c.Replay = ReplayConfig{
-		MaxEventsPerRun: envInt("NEXAU_REPLAY_MAX_EVENTS", 2048),
-		Window:          envDur("NEXAU_REPLAY_WINDOW", 15*time.Minute),
-		MaxReplayBytes:  envInt64("NEXAU_REPLAY_MAX_BYTES", 8<<20),
+		RequestsPerMinuteUser:    envInt64("NEXAU_RATE_REQ_PER_MIN_USER", 600),
+		RequestsPerMinuteTenant:  envInt64("NEXAU_RATE_REQ_PER_MIN_TENANT", 6000),
+		ConcurrentRequestsUser:   envInt64("NEXAU_RATE_CONCURRENT_REQS_USER", 16),
+		ConcurrentRequestsTenant: envInt64("NEXAU_RATE_CONCURRENT_REQS_TENANT", 256),
+		IPRequestsPerMinute:      envInt64("NEXAU_RATE_REQ_PER_MIN_IP", 1200),
+		FailOpen:                 envBool("NEXAU_RATE_FAIL_OPEN", true),
+		SlotTimeout:              envDur("NEXAU_RATE_CONCURRENCY_TIMEOUT", 30*time.Minute),
 	}
 
 	// Metering
@@ -480,6 +398,10 @@ func Load() (*Config, error) {
 		RetryMax:      envInt("NEXAU_METER_RETRY_MAX", 3),
 	}
 
+	// Token accounting: how long a normalization-rules read stays fresh
+	// (UPDATE token_normalization ... takes effect within this TTL).
+	c.NormCacheTTL = envDur("NEXAU_NORM_CACHE_TTL", 30*time.Second)
+
 	// Logging
 	c.Log = LogConfig{
 		Level:      strings.ToLower(envStr("NEXAU_LOG_LEVEL", "info")),
@@ -489,7 +411,7 @@ func Load() (*Config, error) {
 
 	// OTel
 	c.OTel = OTelConfig{
-		ServiceName:    envStr("NEXAU_OTEL_SERVICE_NAME", "nexau-cloud-api"),
+		ServiceName:    envStr("NEXAU_OTEL_SERVICE_NAME", "mash-cloud-api"),
 		TraceEndpoint:  os.Getenv("NEXAU_OTEL_TRACE_ENDPOINT"),
 		TraceInsecure:  envBool("NEXAU_OTEL_TRACE_INSECURE", false),
 		TraceRatio:     envFloat("NEXAU_OTEL_TRACE_RATIO", 1.0),
@@ -517,24 +439,19 @@ func (c *Config) validate() error {
 	if c.Bifrost.BaseURL == "" {
 		errs = append(errs, "NEXAU_BIFROST_URL is required")
 	}
-
-	switch c.Auth.Mode {
-	case "jwks":
-		if c.Auth.JWKSURL == "" {
-			errs = append(errs, "NEXAU_AUTH_JWKS_URL is required in jwks mode")
-		}
-	case "local":
-		if len(c.Auth.HS256Secret) < 32 {
-			errs = append(errs, "NEXAU_AUTH_HS256_SECRET must be ≥32 bytes in local mode")
-		}
-	default:
-		errs = append(errs, fmt.Sprintf("NEXAU_AUTH_MODE must be 'jwks' or 'local', got %q", c.Auth.Mode))
+	if len(c.Auth.HS256Secret) < 32 {
+		errs = append(errs, "NEXAU_AUTH_HS256_SECRET must be ≥32 bytes")
 	}
 
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
 		errs = append(errs, fmt.Sprintf("NEXAU_LOG_LEVEL invalid: %q", c.Log.Level))
+	}
+	switch c.Log.Format {
+	case "json", "text":
+	default:
+		errs = append(errs, fmt.Sprintf("NEXAU_LOG_FORMAT invalid: %q", c.Log.Format))
 	}
 
 	// Payments: fail fast listing EVERY missing key (a payments deploy with
@@ -557,19 +474,46 @@ func (c *Config) validate() error {
 		if !strings.HasPrefix(c.Payments.RazorpayKeyID, "rzp_") {
 			errs = append(errs, "NEXAU_RAZORPAY_KEY_ID should look like rzp_test_… or rzp_live_… (Razorpay Dashboard → API Keys)")
 		}
+	case "stripe":
+		if c.Payments.StripeAPIKey == "" {
+			errs = append(errs, "NEXAU_STRIPE_API_KEY is required when NEXAU_PAYMENT_PROVIDER=stripe")
+		}
+		if c.Payments.StripeWebhookSecret == "" {
+			errs = append(errs, "NEXAU_STRIPE_WEBHOOK_SECRET is required when NEXAU_PAYMENT_PROVIDER=stripe")
+		}
+		if !strings.HasPrefix(c.Payments.StripeAPIKey, "sk_") && !strings.HasPrefix(c.Payments.StripeAPIKey, "rk_") {
+			errs = append(errs, "NEXAU_STRIPE_API_KEY should look like sk_test_… / sk_live_… (or rk_… restricted)")
+		}
+		if c.Payments.StripePublishableKey != "" && !strings.HasPrefix(c.Payments.StripePublishableKey, "pk_") {
+			errs = append(errs, "NEXAU_STRIPE_PUBLISHABLE_KEY should look like pk_test_… / pk_live_…")
+		}
+	case "phonepe":
+		if c.Payments.PhonepeMerchantID == "" {
+			errs = append(errs, "NEXAU_PHONEPE_MERCHANT_ID is required when NEXAU_PAYMENT_PROVIDER=phonepe")
+		}
+		if c.Payments.PhonepeSaltKey == "" {
+			errs = append(errs, "NEXAU_PHONEPE_SALT_KEY is required when NEXAU_PAYMENT_PROVIDER=phonepe")
+		}
+		if c.Payments.PhonepeRedirectURL == "" {
+			errs = append(errs, "NEXAU_PHONEPE_REDIRECT_URL is required when NEXAU_PAYMENT_PROVIDER=phonepe (the frontend return page — PhonePe sends the browser back there with ?order_id=)")
+		}
+		if c.Payments.PhonepeCallbackURL != "" && !isAbsoluteURL(c.Payments.PhonepeCallbackURL) {
+			errs = append(errs, "NEXAU_PHONEPE_CALLBACK_URL must be an absolute URL (https://…/v1/payments/webhook)")
+		}
+		if !isAbsoluteURL(c.Payments.PhonepeRedirectURL) {
+			errs = append(errs, "NEXAU_PHONEPE_REDIRECT_URL must be an absolute URL (https://…/return)")
+		}
+		if m := c.Payments.PhonepeRedirectMode; m != "POST" && m != "REDIRECT" {
+			errs = append(errs, fmt.Sprintf("NEXAU_PHONEPE_REDIRECT_MODE must be POST or REDIRECT, got %q", m))
+		}
 	default:
-		errs = append(errs, fmt.Sprintf("NEXAU_PAYMENT_PROVIDER must be disabled|mock|razorpay, got %q", c.Payments.Provider))
+		errs = append(errs, fmt.Sprintf("NEXAU_PAYMENT_PROVIDER must be disabled|mock|razorpay|stripe|phonepe, got %q", c.Payments.Provider))
 	}
 	if c.Payments.OrderTTL < time.Minute {
 		errs = append(errs, "NEXAU_PAYMENT_ORDER_TTL must be ≥1m")
 	}
 	if c.Payments.SweepInterval < 5*time.Second {
 		errs = append(errs, "NEXAU_PAYMENT_SWEEP_INTERVAL must be ≥5s")
-	}
-	switch c.Log.Format {
-	case "json", "text":
-	default:
-		errs = append(errs, fmt.Sprintf("NEXAU_LOG_FORMAT invalid: %q", c.Log.Format))
 	}
 
 	if c.OTel.TraceRatio < 0 || c.OTel.TraceRatio > 1 {
@@ -581,17 +525,20 @@ func (c *Config) validate() error {
 	if c.Meter.BatchSize < 1 {
 		errs = append(errs, "NEXAU_METER_BATCH_SIZE must be ≥1")
 	}
-	if c.Replay.MaxEventsPerRun < 64 {
-		errs = append(errs, "NEXAU_REPLAY_MAX_EVENTS must be ≥64")
-	}
 	if c.StreamIdleTimeout < 5*time.Second {
 		errs = append(errs, "NEXAU_STREAM_IDLE_TIMEOUT must be ≥5s")
 	}
 	if c.StreamMaxDuration <= c.StreamIdleTimeout {
 		errs = append(errs, "NEXAU_STREAM_MAX_DURATION must exceed STREAM_IDLE_TIMEOUT")
 	}
-	if c.WSSendQueue < 16 {
-		errs = append(errs, "NEXAU_WS_SEND_QUEUE must be ≥16")
+	if c.BifrostReqTimeout < 5*time.Second {
+		errs = append(errs, "NEXAU_BIFROST_REQUEST_TIMEOUT must be ≥5s")
+	}
+	if c.StreamHeartbeatInterval < time.Second {
+		errs = append(errs, "NEXAU_STREAM_HEARTBEAT_INTERVAL must be ≥1s")
+	}
+	if c.StreamWriteDeadline < time.Second {
+		errs = append(errs, "NEXAU_STREAM_WRITE_DEADLINE must be ≥1s")
 	}
 	if c.Auth.AccessTokenTTL < time.Minute {
 		errs = append(errs, "NEXAU_AUTH_ACCESS_TOKEN_TTL must be ≥1m")
@@ -599,29 +546,13 @@ func (c *Config) validate() error {
 	if c.DBMaxConns < c.DBMinConns {
 		errs = append(errs, "NEXAU_DB_MAX_CONNS must be ≥ MIN_CONNS")
 	}
-	// Signup & recovery sanity.
-	if c.Auth.MinPasswordLength < 8 || c.Auth.MinPasswordLength > 128 {
-		errs = append(errs, "NEXAU_AUTH_MIN_PASSWORD_LENGTH must be within [8,128]")
+	if c.Rate.SlotTimeout < time.Minute {
+		errs = append(errs, "NEXAU_RATE_CONCURRENCY_TIMEOUT must be ≥1m")
 	}
-	if c.Auth.ResetTokenTTL > time.Hour || c.Auth.ResetTokenTTL < time.Minute {
-		errs = append(errs, "NEXAU_AUTH_RESET_TOKEN_TTL must be within [1m,1h] (OWASP: short-lived reset)")
-	}
-	if c.Auth.VerifyTokenTTL < 10*time.Minute {
-		errs = append(errs, "NEXAU_AUTH_VERIFY_TOKEN_TTL must be ≥10m")
-	}
-	if c.Auth.ResendCooldown < 0 {
-		errs = append(errs, "NEXAU_AUTH_RESEND_COOLDOWN must be ≥0")
-	}
-	if c.Auth.SignupEnabled && c.Auth.Mode == "jwks" {
-		// Self-serve signup contradicts IdP-managed identities.
-		c.Auth.SignupEnabled = false
-	}
+
 	// Google OAuth wiring sanity (only meaningful when fully configured).
 	googleOn := c.Auth.GoogleClientID != "" && c.Auth.GoogleClientSecret != "" && c.Auth.GoogleRedirectURL != ""
 	if googleOn {
-		if c.Auth.Mode != "local" {
-			errs = append(errs, "NEXAU_AUTH_GOOGLE_* requires NEXAU_AUTH_MODE=local (the API mints the session tokens)")
-		}
 		if c.Auth.WebSuccessURL == "" {
 			errs = append(errs, "NEXAU_AUTH_WEB_SUCCESS_URL is required when Google sign-in is enabled")
 		}
@@ -638,35 +569,6 @@ func (c *Config) validate() error {
 	if c.Auth.OAuthStateTTL < time.Minute || c.Auth.OAuthStateTTL > time.Hour {
 		errs = append(errs, "NEXAU_AUTH_OAUTH_STATE_TTL must be within [1m,1h]")
 	}
-	switch c.Mail.Mode {
-	case "log", "smtp":
-	default:
-		errs = append(errs, fmt.Sprintf("NEXAU_MAIL_MODE invalid: %q (log|smtp)", c.Mail.Mode))
-	}
-	if c.Mail.Mode == "smtp" {
-		if c.Mail.Host == "" || c.Mail.From == "" {
-			errs = append(errs, "NEXAU_MAIL_MODE=smtp requires NEXAU_SMTP_HOST and NEXAU_MAIL_FROM")
-		}
-		if c.Mail.Port < 1 || c.Mail.Port > 65535 {
-			errs = append(errs, "NEXAU_SMTP_PORT out of range")
-		}
-		if c.Auth.SignupEnabled && c.Auth.AppBaseURL == "" {
-			// Reset/verification links need a website destination; without
-			// one, smtp mode would mail token:// pseudo-links (2026-09-19
-			// audit, needs-validation finding).
-			errs = append(errs, "NEXAU_MAIL_MODE=smtp with signup enabled requires NEXAU_APP_BASE_URL (the emailed links' destination)")
-		}
-	}
-	// Emailed links are credentials: the base URL must be https outside
-	// loopback dev (a cleartext link leaks the token on the wire).
-	if c.Auth.AppBaseURL != "" {
-		if err := validateSecureBaseURL(c.Auth.AppBaseURL); err != nil {
-			errs = append(errs, "NEXAU_APP_BASE_URL "+err.Error())
-		}
-	}
-	if c.Auth.UnverifiedRetention < time.Hour {
-		errs = append(errs, "NEXAU_AUTH_UNVERIFIED_RETENTION must be ≥1h")
-	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config validation failed:\n  - %s", strings.Join(errs, "\n  - "))
@@ -674,33 +576,12 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// validateSecureBaseURL accepts https:// URLs and http:// loopback hosts
-// (local development). Everything else — plaintext on a routable host, or a
-// non-web scheme — is a deployment blocker: the link carries a single-use
-// credential and must not cross the network in cleartext.
-func validateSecureBaseURL(u string) error {
-	parsed, err := url.Parse(u)
-	if err != nil {
-		return fmt.Errorf("is not a valid URL: %v", err)
-	}
-	switch parsed.Scheme {
-	case "https":
-		if parsed.Host == "" {
-			return errors.New("must be https:// with a host")
-		}
-		return nil
-	case "http":
-		host := parsed.Hostname()
-		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-			return nil // local dev
-		}
-		return fmt.Errorf("must use https:// for non-loopback host %q (emailed links carry credentials)", host)
-	default:
-		return fmt.Errorf("must be an http(s) URL, got scheme %q", parsed.Scheme)
-	}
-}
-
 // --- env helpers (no external dependency) ---
+
+// isAbsoluteURL reports whether s parses as an absolute http(s) URL.
+func isAbsoluteURL(s string) bool {
+	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
+}
 
 func envStr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -786,7 +667,7 @@ func envList(key string) []string {
 	return out
 }
 
-func runtimeCPUs() int {
+func runtimeNumCPU() int {
 	n, err := strconv.Atoi(os.Getenv("GOMAXPROCS"))
 	if err == nil && n > 0 {
 		return n
@@ -796,5 +677,9 @@ func runtimeCPUs() int {
 			return v
 		}
 	}
-	return runtimeNumCPU()
+	return runtime.NumCPU()
 }
+
+// ErrNoAuthPath is a sentinel used by main.go to warn (not fail) when no
+// Google OAuth is configured — no client could ever log in.
+var ErrNoAuthPath = errors.New("config: google oauth not configured")

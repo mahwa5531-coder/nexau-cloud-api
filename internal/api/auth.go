@@ -2,49 +2,12 @@ package api
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/nexau-cloud/nexau-api/internal/auth"
-	"github.com/nexau-cloud/nexau-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/auth"
+	"github.com/mash-cloud/mash-api/internal/domain"
 )
-
-// handleLogin: POST /v1/auth/login {email, password}
-//
-// Rate-limited per source IP BEFORE any credential lookup (no user
-// enumeration, no bcrypt work for flooded sources). Failures are uniform.
-func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r, a.cfg.TrustProxyHeaders)
-	if a.ipLimited(r, ip) {
-		w.Header().Set("Retry-After", "60")
-		writeError(w, r, domain.ErrRateLimited(60_000, "login_ip"))
-		return
-	}
-
-	var body struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-	if err := decodeJSON(r, &body); err != nil || body.Email == "" || body.Password == "" {
-		writeError(w, r, domain.ErrValidation("email and password are required"))
-		return
-	}
-	if len(body.Email) > 320 || len(body.Password) > 256 {
-		writeError(w, r, domain.ErrValidation("email or password exceeds the allowed length"))
-		return
-	}
-	body.Email = strings.TrimSpace(strings.ToLower(body.Email))
-
-	ua := r.Header.Get("User-Agent")
-	pair, err := a.authSvc.Login(r.Context(), body.Email, body.Password, ua)
-	if err != nil {
-		a.countLoginFailure(r, ip)
-		writeError(w, r, domain.AsError(err))
-		return
-	}
-	writeOK(w, pair)
-}
 
 // handleRefresh: POST /v1/auth/refresh {refresh_token}
 // Per-IP throttled (2026-09-19 audit, cluster A): rotation is a PG-write +
@@ -100,27 +63,35 @@ func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}{true})
 }
 
-// loginThrottleKey is the per-IP failed-login window.
-func loginThrottleKey(ip string) string { return "rl:login:ip:" + ip }
-
-// ipLimited enforces the per-IP login throttle: sources that produced too
-// many FAILED attempts inside the window are locked out (fail-open on Redis
-// loss — availability, with the alarm counter from the limiter).
-func (a *API) ipLimited(r *http.Request, ip string) bool {
-	if a.lim == nil || a.cfg.Auth.MaxFailedLoginsPerIP <= 0 || ip == "" {
-		return false
-	}
-	return a.lim.Count(r.Context(), loginThrottleKey(ip), 15*time.Minute) >=
-		int64(a.cfg.Auth.MaxFailedLoginsPerIP)
-}
-
-// countLoginFailure records one failed attempt in the throttle window.
-func (a *API) countLoginFailure(r *http.Request, ip string) {
-	if a.lim == nil || a.cfg.Auth.MaxFailedLoginsPerIP <= 0 || ip == "" {
+// handleLogoutAll: POST /v1/auth/logout-all — revoke every refresh-token
+// family for the authenticated user (sign out everywhere: lost/stolen
+// device response). The response counts the revoked sessions; the presented
+// access token is blacklisted for its remaining lifetime when revocation
+// checking is on.
+func (a *API) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
+	idn := auth.FromIdentity(r.Context())
+	if idn == nil {
+		writeError(w, r, domain.ErrUnauthorized(nil))
 		return
 	}
-	a.lim.Hit(r.Context(), loginThrottleKey(ip), 15*time.Minute,
-		strconv.FormatInt(time.Now().UnixNano(), 36))
+	claims := auth.FromClaims(r.Context())
+	var jti string
+	var ttl time.Duration
+	if claims != nil {
+		jti = claims.TokenID
+		ttl = time.Until(claims.ExpiresAt)
+	}
+	n, err := a.authSvc.LogoutAll(r.Context(), idn.User.ID, jti, ttl)
+	if err != nil {
+		writeError(w, r, domain.AsError(err))
+		return
+	}
+	// The cached identity is fine (plan/status unchanged); only token state
+	// is invalidated, and that lives in refresh_tokens + the jti blacklist.
+	writeOK(w, struct {
+		LoggedOut      bool  `json:"logged_out"`
+		SessionsKilled int64 `json:"sessions_killed"`
+	}{true, n})
 }
 
 // clientIP extracts the source address. X-Forwarded-For is honored only when

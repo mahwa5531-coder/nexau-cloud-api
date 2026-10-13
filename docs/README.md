@@ -1,30 +1,29 @@
-# NexaU Cloud API — Documentation
+# MASh Cloud API — Documentation
 
 One page per concern. Read in this order for a new engineer; jump straight
 to the section you need otherwise.
 
 | Doc | What it covers | When you need it |
 |---|---|---|
-| [`../README.md`](../README.md) | Product overview, quick start, API surface summary | First contact |
-| [`DEPLOYMENT.md`](DEPLOYMENT.md) | **Fresh-to-deploy runbook**: prerequisites, required env keys, compose/bare-metal bring-up, smoke tests, rollback | Standing the service up |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | System structure: packages, data flow, streaming (SSE/WS), replay/resume, tenancy model | Understanding how it all fits |
-| [`PAYMENT-GATEWAY.md`](PAYMENT-GATEWAY.md) | Razorpay integration: who owns what, flows, exactly-once crediting, env keys, security posture | Anything money-related |
-| [`DESKTOP-CONNECTION.md`](DESKTOP-CONNECTION.md) | Web-to-desktop handshake, OAuth flow, exchange codes | Desktop client integration |
+| [`../README.md`](../README.md) | Product overview, quick start, endpoint summary | First contact |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | **Current as-built architecture**: topology, the LLM tunnel hot path, identity model, data model, invariants | Understanding the system as it is |
+| [`api.md`](api.md) | **The HTTP contract**: every endpoint, `/v1/me` plan+quota shape, gate order, SSE semantics, billing/webhooks, rate limits | Client integration |
+| [`TABLES.md`](TABLES.md) | **The data dictionary**: every table + where the 5h/weekly window budgets live (`plans.limits`) and where the token-normalization values live (`token_normalization`) — both hot-changeable via SQL | Schema questions, operator dials |
+| [`CLEANUP-2026-10-05.md`](CLEANUP-2026-10-05.md) | **The simplification audit trail**: what was deleted (agent runtime, non-Google auth), what replaced it, the DB re-provisioning step | Why the codebase looks like this |
+| [`DESKTOP-CONNECTION.md`](DESKTOP-CONNECTION.md) | Web-to-desktop handshake, OAuth flow, exchange codes, stream semantics | Desktop client integration |
+| [`PAYMENT-GATEWAY.md`](PAYMENT-GATEWAY.md) | Payment-gateway integration (Razorpay/Stripe/PhonePe): who owns what, flows, exactly-once subscription activation, env keys, security posture | Anything money-related |
+| [`FRONTEND-PAYMENTS.md`](FRONTEND-PAYMENTS.md) | The client-facing endpoint map + per-provider call sequences (plans-only purchase flow) | Coding the frontend checkout |
+| [`MODELS-AND-PRICING.md`](MODELS-AND-PRICING.md) | **The launch decision doc**: October-2026 model lineup (GPT-6 Luna, Gemini 3.8 Flash, Claude Sonnet 5.5…), price-proportional normalization weights, Free/Pro plan design, Indian-market pricing strategy, ZDR/no-training matrix | Models, plans, pricing, data-retention policy |
 | [`CIRCUIT-BREAKER.md`](CIRCUIT-BREAKER.md) | Upstream (Bifrost) failure isolation and recovery behavior | Debugging upstream outages |
+| [`DEPLOYMENT.md`](DEPLOYMENT.md) | **Fresh-to-deploy runbook**: prerequisites, required env keys, compose/bare-metal bring-up, smoke tests, rollback | Standing the service up |
 | [`OPERATIONS.md`](OPERATIONS.md) | Runbook: metrics, alerts, common incidents, audit history | On-call |
 
 ## Source of truth for configuration
 
-`.env.example` at the repo root documents **every** environment key
-(~100 keys, 14 sections) with defaults and security notes. The config loader
-validates all of them at boot and fails fast with the complete list of
-problems — never one error at a time.
-
-## Validation evidence
-
-`VALIDATION_REPORT.md` (repo root) holds the current full-suite results
-(46 validation files, 219 tests, race-detector clean). Regenerate with
-`scripts/run_validation.sh`.
+`.env.example` at the repo root documents **every** environment key with
+defaults and security notes. The config loader validates all of them at boot
+and fails fast with the complete list of problems — never one error at a
+time.
 
 ## Conventions (short form)
 
@@ -33,7 +32,7 @@ problems — never one error at a time.
 - Layering: `cmd/server` → `internal/api` (thin handlers) →
   `internal/<domain>` services → `internal/store/repos` (SQL).
   Business logic never lives in handlers; SQL never leaves repos.
-- Every mutation surface is idempotent (`Idempotency-Key` honored).
 - Money is integer paise; floats never appear on money paths.
-- Tests: unit + scenario files beside the code, HTTP e2e in `tests/`,
-  fault-injection matrix in `validation/`. CI runs everything with `-race`.
+- Tests: unit files beside the code, integration suite in `tests/`
+  (miniredis + in-memory fakes + fake Bifrost — no infra required). CI runs
+  everything with `-race`.

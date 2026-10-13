@@ -11,20 +11,17 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/nexau-cloud/nexau-api/internal/domain"
-	"github.com/nexau-cloud/nexau-api/internal/ids"
-	"github.com/nexau-cloud/nexau-api/internal/store"
-	"github.com/nexau-cloud/nexau-api/internal/store/repos"
+	"github.com/mash-cloud/mash-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/ids"
+	"github.com/mash-cloud/mash-api/internal/store"
+	"github.com/mash-cloud/mash-api/internal/store/repos"
 )
 
 // Narrow storage seams: the service depends on behavior, not concrete repos
 // (and gains an in-memory fake for rotation/reuse regression tests).
 type UsersStore interface {
-	ByEmail(ctx context.Context, email string) (*domain.User, error)
 	ByID(ctx context.Context, id string) (*domain.User, error)
-	PasswordHash(ctx context.Context, userID string) (string, error)
 	TouchLogin(ctx context.Context, id string) error
-	UpdatePasswordHash(ctx context.Context, id string, hash string) error
 }
 
 type TenantsStore interface {
@@ -42,23 +39,14 @@ type RefreshStore interface {
 	LinkReplacement(ctx context.Context, oldID, newID string) error
 }
 
-// Service implements the full auth flows against PostgreSQL + Redis.
+// Service implements the auth flows against PostgreSQL + Redis. Google OAuth
+// is the only way an identity enters the system; the desktop obtains its
+// token pair via the web-to-desktop handshake (see desktop_code.go).
 type Service struct {
 	Users       UsersStore
 	Tenants     TenantsStore
 	RefreshRepo RefreshStore
 	Redis       redis.UniversalClient
-
-	// Signup & recovery collaborators (nil in pure IdP mode → endpoints unmounted).
-	Registrar         AccountStore
-	Recovery          RecoveryStore
-	Mail              Mailer
-	RequireVerified   bool          // login gate for unverified accounts
-	VerifyTTL         time.Duration // verification token lifetime
-	ResetTTL          time.Duration // reset token lifetime
-	ResendCooldown    time.Duration // per (purpose,email) send cooldown
-	MinPasswordLength int
-	AppBaseURL        string // website base for emailed links
 
 	// Google OAuth + web-to-desktop handshake (nil/sealed = disabled).
 	Google         *GoogleProvider // nil → OAuth endpoints 503
@@ -69,14 +57,14 @@ type Service struct {
 	OAuthStateTTL  time.Duration
 	DesktopCodeTTL time.Duration
 
-	Signer          *LocalSigner // nil in pure jwks mode
+	Signer          *LocalSigner
 	AccessTTL       time.Duration
 	RefreshTTL      time.Duration
 	DeviceTTL       time.Duration
 	RevocationCheck bool
 }
 
-// TokenPair is the login/refresh response payload.
+// TokenPair is the desktop-exchange/refresh response payload.
 type TokenPair struct {
 	AccessToken  string     `json:"access_token"`
 	TokenType    string     `json:"token_type"`
@@ -88,47 +76,6 @@ type TokenPair struct {
 	// RefreshID is the server-side id of the issued refresh token
 	// (for linking rotations; not part of the client contract).
 	RefreshID string `json:"-"`
-}
-
-// Login authenticates email+password and issues a fresh token family.
-func (s *Service) Login(ctx context.Context, email, password, userAgent string) (*TokenPair, error) {
-	u, err := s.Users.ByEmail(ctx, email)
-	if err != nil {
-		return nil, store.MapDBError(err)
-	}
-	if u == nil || u.Status != "active" {
-		// Uniform error: no account enumeration.
-		return nil, domain.ErrValidation("invalid email or password")
-	}
-	// Email-verification gate (local mode): unverified accounts cannot
-	// obtain tokens — distinct code so clients can route to the verify UX.
-	if s.RequireVerified && !u.EmailVerified {
-		return nil, domain.ErrEmailNotVerified()
-	}
-	hash, err := s.usersPasswordHash(ctx, u.ID)
-	if err != nil || hash == "" {
-		return nil, domain.ErrValidation("invalid email or password")
-	}
-	if !bcryptCompare(hash, password) {
-		return nil, domain.ErrValidation("invalid email or password")
-	}
-
-	// Resolve default tenant (first active membership).
-	memberships, err := s.Tenants.Memberships(ctx, u.ID)
-	if err != nil {
-		return nil, store.MapDBError(err)
-	}
-	if len(memberships) == 0 {
-		return nil, domain.ErrForbidden("user has no active tenant membership")
-	}
-	tenantID := memberships[0].TenantID
-	role := memberships[0].Role
-
-	if err := s.Users.TouchLogin(ctx, u.ID); err != nil {
-		slog.WarnContext(ctx, "auth: touch login failed", "error", err)
-	}
-
-	return s.issueTokens(ctx, u, tenantID, role, "", userAgent, "")
 }
 
 // Refresh rotates a refresh token. Reuse of a consumed token revokes the
@@ -169,8 +116,7 @@ func (s *Service) Refresh(ctx context.Context, refreshToken, userAgent string) (
 	}
 	tenantID, role := rt.TenantID, ""
 	if tenantID != "" {
-		m, err := s.Tenants.Membership(ctx, tenantID, u.ID)
-		if err == nil && m != nil && m.Status == "active" {
+		if m, err := s.Tenants.Membership(ctx, tenantID, u.ID); err == nil && m != nil && m.Status == "active" {
 			role = m.Role
 		}
 	}
@@ -208,16 +154,36 @@ func (s *Service) Logout(ctx context.Context, refreshToken, accessJTI string, ac
 			}
 		}
 	}
-	if s.RevocationCheck && accessJTI != "" && s.Redis != nil {
-		ttl := accessTTL
-		if ttl <= 0 {
-			ttl = s.AccessTTL
-		}
-		if ttl > 0 {
-			s.Redis.Set(ctx, "auth:blacklist:"+accessJTI, "1", ttl)
-		}
-	}
+	s.blacklistJTI(ctx, accessJTI, accessTTL)
 	return nil
+}
+
+// LogoutAll revokes EVERY live refresh-token family for the user (stolen or
+// lost device: sign out everywhere) and blacklists the presented access token.
+// Within one access-token TTL (15 min by default) all other devices' access
+// tokens also die at their next refresh — every family is revoked.
+func (s *Service) LogoutAll(ctx context.Context, userID, accessJTI string, accessTTL time.Duration) (int64, error) {
+	n, err := s.RefreshRepo.RevokeUser(ctx, userID, "logout_all")
+	if err != nil {
+		return 0, store.MapDBError(err)
+	}
+	s.blacklistJTI(ctx, accessJTI, accessTTL)
+	return n, nil
+}
+
+// blacklistJTI denies the presented access token for its remaining lifetime
+// when central revocation checking is enabled (no-op otherwise).
+func (s *Service) blacklistJTI(ctx context.Context, accessJTI string, accessTTL time.Duration) {
+	if !s.RevocationCheck || accessJTI == "" || s.Redis == nil {
+		return
+	}
+	ttl := accessTTL
+	if ttl <= 0 {
+		ttl = s.AccessTTL
+	}
+	if ttl > 0 {
+		s.Redis.Set(ctx, "auth:blacklist:"+accessJTI, "1", ttl)
+	}
 }
 
 // IsBlacklisted consults the jti blacklist (best-effort; Redis-down = allow,
@@ -237,8 +203,8 @@ func (s *Service) IsBlacklisted(ctx context.Context, jti string) bool {
 
 // issueTokens mints an access token and an opaque refresh token. family is
 // the family the refresh token joins; "" starts a fresh family rooted at the
-// new token (login). Rotations pass the consumed token's FamilyID so the
-// whole chain shares one revocation domain.
+// new token (desktop exchange). Rotations pass the consumed token's FamilyID
+// so the whole chain shares one revocation domain.
 func (s *Service) issueTokens(ctx context.Context, u *domain.User, tenantID, role, deviceID, userAgent, family string) (*TokenPair, error) {
 	if s.Signer == nil {
 		return nil, &domain.Error{
@@ -261,7 +227,7 @@ func (s *Service) issueTokens(ctx context.Context, u *domain.User, tenantID, rol
 
 	refreshID := ids.RefreshTokenID()
 	if family == "" {
-		// Login: a fresh family rooted at this token.
+		// Exchange: a fresh family rooted at this token.
 		family = refreshID
 	}
 
@@ -292,7 +258,7 @@ func (s *Service) issueTokens(ctx context.Context, u *domain.User, tenantID, rol
 		ExpiresIn:    int64(s.AccessTTL.Seconds()),
 		RefreshToken: refreshSecret,
 		User: UserInfo{
-			ID: u.ID, Email: u.Email, DisplayName: u.DisplayName,
+			ID: u.ID, Email: u.Email, DisplayName: u.DisplayName, AvatarURL: u.AvatarURL,
 			Status: u.Status, IsPlatformAdmin: u.IsPlatformAdmin,
 			EmailVerified: u.EmailVerified,
 		},
@@ -306,14 +272,4 @@ func sanitizeUA(ua string) string {
 		ua = ua[:256]
 	}
 	return ua
-}
-
-// bcryptCompare is isolated for testability.
-var bcryptCompare = func(hash, password string) bool {
-	return bcryptOK(hash, password)
-}
-
-// usersPasswordHash loads the stored bcrypt hash via the storage seam.
-func (s *Service) usersPasswordHash(ctx context.Context, userID string) (string, error) {
-	return s.Users.PasswordHash(ctx, userID)
 }

@@ -9,29 +9,22 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/nexau-cloud/nexau-api/internal/domain"
-	"github.com/nexau-cloud/nexau-api/internal/store"
+	"github.com/mash-cloud/mash-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/store"
 )
 
-// UsersRepo persists users.
+// UsersRepo persists users (Google OAuth identities only).
 type UsersRepo struct{ Pool *pgxpool.Pool }
 
 func NewUsers(p *pgxpool.Pool) *UsersRepo { return &UsersRepo{Pool: p} }
 
-const userCols = `id, email, display_name, status, is_platform_admin, auth_provider, email_verified, created_at, updated_at`
+const userCols = `id, email, display_name, avatar_url, status, is_platform_admin, auth_provider, external_subject, email_verified, created_at, updated_at`
 
 func scanUser(row pgx.Row) (*domain.User, error) {
 	u := &domain.User{}
-	err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.Status, &u.IsPlatformAdmin, &u.AuthProvider, &u.EmailVerified, &u.CreatedAt, &u.UpdatedAt)
-	return u, err
-}
-
-func (r *UsersRepo) ByEmail(ctx context.Context, email string) (*domain.User, error) {
-	u, err := scanUser(r.Pool.QueryRow(ctx,
-		`SELECT `+userCols+` FROM users WHERE lower(email) = lower($1)`, email))
-	if store.IsNotFound(err) {
-		return nil, nil
-	}
+	err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.AvatarURL, &u.Status,
+		&u.IsPlatformAdmin, &u.AuthProvider, &u.ExternalSubject, &u.EmailVerified,
+		&u.CreatedAt, &u.UpdatedAt)
 	return u, err
 }
 
@@ -44,47 +37,8 @@ func (r *UsersRepo) ByID(ctx context.Context, id string) (*domain.User, error) {
 	return u, err
 }
 
-// ByExternalSubject resolves an IdP-managed identity.
-func (r *UsersRepo) ByExternalSubject(ctx context.Context, provider, subject string) (*domain.User, error) {
-	u, err := scanUser(r.Pool.QueryRow(ctx,
-		`SELECT `+userCols+` FROM users WHERE auth_provider = $1 AND external_subject = $2`,
-		provider, subject))
-	if store.IsNotFound(err) {
-		return nil, nil
-	}
-	return u, err
-}
-
-func (r *UsersRepo) Create(ctx context.Context, u *domain.User, passwordHash *string) error {
-	_, err := r.Pool.Exec(ctx, `
-                INSERT INTO users (id, email, display_name, password_hash, status, is_platform_admin, auth_provider, external_subject, email_verified)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		u.ID, u.Email, u.DisplayName, passwordHash, u.Status, u.IsPlatformAdmin, u.AuthProvider, "", u.EmailVerified)
-	return err
-}
-
-// SetEmailVerified flips the verification flag (recovery flow).
-func (r *UsersRepo) SetEmailVerified(ctx context.Context, userID string) error {
-	_, err := r.Pool.Exec(ctx, `UPDATE users SET email_verified = TRUE, updated_at = now() WHERE id = $1`, userID)
-	return err
-}
-
 func (r *UsersRepo) TouchLogin(ctx context.Context, id string) error {
 	_, err := r.Pool.Exec(ctx, `UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = $1`, id)
-	return err
-}
-
-// PasswordHash loads the stored bcrypt hash for login verification (auth
-// service seam; COALESCE keeps the SQL a single row even for IdP-only users).
-func (r *UsersRepo) PasswordHash(ctx context.Context, userID string) (string, error) {
-	var h string
-	err := r.Pool.QueryRow(ctx,
-		`SELECT COALESCE(password_hash, '') FROM users WHERE id = $1`, userID).Scan(&h)
-	return h, err
-}
-
-func (r *UsersRepo) UpdatePasswordHash(ctx context.Context, id string, hash string) error {
-	_, err := r.Pool.Exec(ctx, `UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1`, id, hash)
 	return err
 }
 
@@ -163,6 +117,9 @@ func (r *SubscriptionsRepo) Effective(ctx context.Context, tenantID string) (*do
 	s := &domain.Subscription{}
 	var limits []byte
 	var models []byte
+	// The period-end check IS the expiry mechanism (read-side, no
+	// sweeper): an active-status row past its paid-through date is not
+	// effective — the resolver's free-plan fallback applies instead.
 	err := r.Pool.QueryRow(ctx, `
                 SELECT sub.id, sub.tenant_id, sub.plan_id, sub.status,
                        sub.current_period_start, sub.current_period_end,
@@ -171,6 +128,7 @@ func (r *SubscriptionsRepo) Effective(ctx context.Context, tenantID string) (*do
                 JOIN plans pl ON pl.id = sub.plan_id
                 WHERE sub.tenant_id = $1
                   AND sub.status IN ('trialing','active','past_due')
+                  AND (sub.current_period_end IS NULL OR sub.current_period_end > now())
                 ORDER BY sub.status = 'past_due' ASC, sub.created_at DESC
                 LIMIT 1`, tenantID).
 		Scan(&s.ID, &s.TenantID, &s.PlanID, &s.Status,
@@ -190,6 +148,32 @@ func (r *SubscriptionsRepo) Effective(ctx context.Context, tenantID string) (*do
 		_ = jsonUnmarshal(models, &s.Plan.Models)
 	}
 	return s, nil
+}
+
+// PlanByCode resolves a plan by its code — used by the identity
+// resolver's FREE-PLAN DEFAULT: a tenant without an effective paid
+// subscription falls back to the 'free' plan's limits + model allowlist
+// (a brand-new tenant is Free by default, never plan-less-and-unbounded).
+func (r *SubscriptionsRepo) PlanByCode(ctx context.Context, code string) (*domain.Plan, error) {
+	p := &domain.Plan{}
+	var limits []byte
+	var models []byte
+	err := r.Pool.QueryRow(ctx, `
+                SELECT id, code, name, limits, models FROM plans WHERE code = $1`, code).
+		Scan(&p.ID, &p.Code, &p.Name, &limits, &models)
+	if store.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(limits) > 2 {
+		_ = jsonUnmarshal(limits, &p.Limits)
+	}
+	if len(models) > 2 {
+		_ = jsonUnmarshal(models, &p.Models)
+	}
+	return p, nil
 }
 
 // EntitlementsRepo reads tenant entitlement overrides.

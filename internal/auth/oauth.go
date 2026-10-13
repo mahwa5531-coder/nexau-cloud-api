@@ -41,18 +41,16 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/nexau-cloud/nexau-api/internal/domain"
-	"github.com/nexau-cloud/nexau-api/internal/ids"
-	"github.com/nexau-cloud/nexau-api/internal/store/repos"
+	"github.com/mash-cloud/mash-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/ids"
+	"github.com/mash-cloud/mash-api/internal/store/repos"
 )
 
 // OAuthStore provisions OAuth identities (implemented by repos.OAuthUsersRepo).
 type OAuthStore interface {
-	// FindOrCreateGoogleUser resolves the identity per the three cases
-	// (login / link / provision) and reports which one happened. A link onto
-	// an UNVERIFIED local account is refused with repos.ErrOAuthAccountUnverified
-	// (anti pre-hijacking, 2026-09-19 audit finding 3).
-	FindOrCreateGoogleUser(ctx context.Context, sub, email, displayName string) (*domain.User, repos.OAuthOutcome, error)
+	// FindOrCreateGoogleUser resolves the identity per the documented cases
+	// (login / provision) with race arbitration.
+	FindOrCreateGoogleUser(ctx context.Context, sub, email, displayName, avatarURL string) (*domain.User, error)
 }
 
 // DevicesStore registers desktop devices (implemented by repos.DevicesRepo).
@@ -349,50 +347,31 @@ func (s *Service) FinishGoogleOAuth(ctx context.Context, code, state, txCookie s
 	return u, grant, nil
 }
 
-// resolveGoogleUser applies the three cases with the documented race retries.
-// On an actual LINK (case 2) the account owner is notified — a Google identity
-// appearing on a password account must never be a silent event.
+// resolveGoogleUser applies the documented cases with race retries
+// (login / provision).
 func (s *Service) resolveGoogleUser(ctx context.Context, ident *GoogleIdentity) (*domain.User, error) {
 	name := ident.Name
 	if len(name) > 128 {
 		name = name[:128]
 	}
+	avatar := ident.Picture
+	if len(avatar) > 2048 {
+		avatar = avatar[:2048]
+	}
 	for attempt := 0; attempt < 3; attempt++ {
-		u, outcome, err := s.OAuth.FindOrCreateGoogleUser(ctx, ident.Sub, ident.Email, name)
+		u, err := s.OAuth.FindOrCreateGoogleUser(ctx, ident.Sub, ident.Email, name, avatar)
 		if err == nil {
-			if outcome == repos.OAuthLinked {
-				s.notifyLinked(ctx, u)
-			}
 			return u, nil
 		}
 		if errors.Is(err, repos.ErrOAuthSubjectRace) || repos.IsEmailTaken(err) {
-			continue // the winner committed; re-run resolves to case 1/2
+			continue // the winner committed; re-run resolves to the login case
 		}
 		if errors.Is(err, repos.ErrIdentityConflict) {
 			return nil, domain.ErrIdentityConflict()
 		}
-		if errors.Is(err, repos.ErrOAuthAccountUnverified) {
-			// Pre-hijacking defense: the email match never proved mailbox control.
-			return nil, domain.ErrOAuthAccountUnverified()
-		}
 		return nil, repos.AsDomain(err)
 	}
 	return nil, domain.ErrInternal(errors.New("oauth resolution did not converge"))
-}
-
-// notifyLinked best-effort informs the account owner that a Google identity
-// was linked (the audit's "victim never notified" gap). Failure never fails
-// the sign-in — the link itself is already committed and legitimate under the
-// verified-gate.
-func (s *Service) notifyLinked(ctx context.Context, u *domain.User) {
-	if s.Mail == nil || u == nil || u.Email == "" {
-		return
-	}
-	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if err := s.Mail.SendOAuthLinked(nctx, u.Email); err != nil {
-		slog.WarnContext(ctx, "auth: oauth-link notification failed", "error", err)
-	}
 }
 
 // resolveTenant picks the first active membership (login parity).
@@ -405,28 +384,6 @@ func (s *Service) resolveTenant(ctx context.Context, userID string) (string, str
 		return "", "", domain.ErrForbidden("user has no active tenant membership")
 	}
 	return ms[0].TenantID, ms[0].Role, nil
-}
-
-// LookupEmail powers POST /v1/auth/lookup (the login screen's email step).
-// This is a purposeful, rate-limited account-resolution surface: the caller
-// learns only whether the email exists and which door it belongs to.
-func (s *Service) LookupEmail(ctx context.Context, email string) (exists bool, provider string, err error) {
-	email = strings.ToLower(strings.TrimSpace(email))
-	if email == "" || !validEmail(email) {
-		return false, "", domain.ErrValidation("a valid email address is required")
-	}
-	u, err := s.Users.ByEmail(ctx, email)
-	if err != nil {
-		return false, "", storeMapError(err)
-	}
-	if u == nil || u.Status != "active" {
-		return false, "", nil
-	}
-	p := u.AuthProvider
-	if p == "" {
-		p = "local"
-	}
-	return true, p, nil
 }
 
 // ExchangeWebGrant consumes the single-use grant and mints the short web

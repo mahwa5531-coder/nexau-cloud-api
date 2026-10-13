@@ -1,14 +1,17 @@
-// Command server runs the NexaU Cloud API: the secure, scalable control and
-// model-access gateway between the NexAU desktop runtime and the Bifrost LLM
-// gateway.
+// Command server runs the MASh Cloud API: the thin cloud layer between the
+// MASh desktop runtime and the Bifrost LLM gateway.
+//
+// Responsibilities (and nothing else): Google-OAuth identity, subscriptions
+// and quotas, credit top-ups (Razorpay), and the LLM tunnel
+// (POST /v1/chat/completions → Bifrost, SSE). The agent runtime — sessions,
+// transcripts, tools, files, execution — lives entirely on the desktop.
 //
 // Boot order (fail fast, in dependency order): config → observability →
-// PostgreSQL (migrations) → Redis → auth → rate limiting/idempotency →
-// metering → event bus → run manager → agent services → HTTP.
+// PostgreSQL (migrations) → Redis → auth → rate limiting → metering →
+// Bifrost client → LLM proxy → payments → HTTP.
 //
-// Shutdown order (spec §34): stop accepting → close WebSockets (1001) →
-// cancel in-flight runs (grace) → drain usage metering → flush telemetry →
-// close Redis → close PostgreSQL → exit.
+// Shutdown order: stop accepting → drain the usage metering queue → flush
+// telemetry → close Redis → close PostgreSQL → exit.
 package main
 
 import (
@@ -20,21 +23,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexau-cloud/nexau-api/internal/agent"
-	"github.com/nexau-cloud/nexau-api/internal/api"
-	"github.com/nexau-cloud/nexau-api/internal/auth"
-	"github.com/nexau-cloud/nexau-api/internal/bifrost"
-	"github.com/nexau-cloud/nexau-api/internal/config"
-	"github.com/nexau-cloud/nexau-api/internal/idempotency"
-	"github.com/nexau-cloud/nexau-api/internal/metering"
-	"github.com/nexau-cloud/nexau-api/internal/middleware"
-	"github.com/nexau-cloud/nexau-api/internal/observability"
-	"github.com/nexau-cloud/nexau-api/internal/payment"
-	"github.com/nexau-cloud/nexau-api/internal/payment/razorpay"
-	"github.com/nexau-cloud/nexau-api/internal/ratelimit"
-	"github.com/nexau-cloud/nexau-api/internal/store"
-	"github.com/nexau-cloud/nexau-api/internal/store/repos"
-	"github.com/nexau-cloud/nexau-api/internal/streaming"
+	"github.com/mash-cloud/mash-api/internal/api"
+	"github.com/mash-cloud/mash-api/internal/auth"
+	"github.com/mash-cloud/mash-api/internal/bifrost"
+	"github.com/mash-cloud/mash-api/internal/config"
+	"github.com/mash-cloud/mash-api/internal/llm"
+	"github.com/mash-cloud/mash-api/internal/metering"
+	"github.com/mash-cloud/mash-api/internal/middleware"
+	"github.com/mash-cloud/mash-api/internal/observability"
+	"github.com/mash-cloud/mash-api/internal/payment"
+	"github.com/mash-cloud/mash-api/internal/payment/phonepe"
+	"github.com/mash-cloud/mash-api/internal/payment/razorpay"
+	"github.com/mash-cloud/mash-api/internal/payment/stripe"
+	"github.com/mash-cloud/mash-api/internal/ratelimit"
+	"github.com/mash-cloud/mash-api/internal/store"
+	"github.com/mash-cloud/mash-api/internal/store/repos"
 )
 
 func main() {
@@ -52,17 +55,9 @@ func run() error {
 	}
 
 	// 2. Observability (logging, tracing, metrics). Degrades, never blocks.
-	// The mail-link allow entry releases the deny-list's "link" key ONLY in
-	// log-mode deployments that opt in via NEXAU_MAIL_LOG_LINKS — the knob
-	// was dead otherwise (redaction beat the opt-in; E2E 2026-09-23).
-	mailAllow := []string{}
-	if cfg.Mail.Mode != "smtp" && cfg.Mail.LogLinks {
-		mailAllow = []string{"link"}
-	}
 	otel, logger, err := observability.Setup(context.Background(), observability.LogOTelConfig{
 		Log: observability.LogConfig{
 			Level: cfg.Log.Level, Format: cfg.Log.Format, RedactKeys: cfg.Log.RedactKeys,
-			AllowKeys: mailAllow,
 		},
 		ServiceName:    cfg.OTel.ServiceName,
 		TraceEndpoint:  cfg.OTel.TraceEndpoint,
@@ -75,8 +70,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	logger.Info("nexau-cloud-api starting",
-		"addr", cfg.HTTPAddr, "auth_mode", cfg.Auth.Mode, "bifrost", cfg.Bifrost.BaseURL)
+	logger.Info("mash-cloud-api starting",
+		"addr", cfg.HTTPAddr, "bifrost", cfg.Bifrost.BaseURL)
+
+	// Google-only posture guard: without Google OAuth configured, no client
+	// can ever obtain a token. That is almost certainly a misconfiguration —
+	// say so loudly instead of serving 401s in silence. (Not a hard error:
+	// signer-only deployments that mint tokens out-of-band, such as test
+	// harnesses, are legal.)
+	if cfg.Auth.GoogleClientID == "" {
+		logger.Warn("google sign-in is not configured (NEXAU_AUTH_GOOGLE_*) - " +
+			"no client can log in. This is only valid for test harnesses.")
+	}
 
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
@@ -108,27 +113,14 @@ func run() error {
 	subs := repos.NewSubscriptions(pg.Pool)
 	ents := repos.NewEntitlements(pg.Pool)
 	refresh := repos.NewRefreshTokens(pg.Pool)
-	recovery := repos.NewRecoveryTokens(pg.Pool)
-	sessionsRepo := repos.NewSessions(pg.Pool)
-	runsRepo := repos.NewRuns(pg.Pool)
-	usageRepo := repos.NewUsage(pg.Pool)
+	calls := repos.NewLLMCalls(pg.Pool)
 
-	// 6. Auth: verifier (local and/or JWKS) + resolver + service.
-	verifier, signer, err := buildVerifier(cfg)
-	if err != nil {
-		return err
-	}
+	// 6. Auth: local HS256 signer/verifier + identity resolver + Google OAuth.
+	signer := auth.NewLocalSigner(cfg.Auth.HS256Secret, cfg.Auth.Issuer, cfg.Auth.Audience,
+		cfg.Auth.Leeway, cfg.Auth.AccessTokenTTL)
 	resolver := &auth.IdentityResolver{
 		Users: users, Tenants: tenants, Subs: subs, Ents: ents,
 		Redis: rd.Client, CacheTTL: 30 * time.Second,
-	}
-	// Signup & recovery collaborators — local mode only (jwks deployments
-	// manage identities at the IdP; config force-disables the endpoints).
-	var registrar auth.AccountStore
-	var recoveryStore auth.RecoveryStore
-	var mailer auth.Mailer = auth.LogMailer{}
-	if cfg.Auth.Mode != "jwks" {
-		registrar, recoveryStore, mailer = recovery, recovery, buildMailer(cfg)
 	}
 
 	// Google OAuth ("Continue with Google") — mounted only when fully
@@ -136,12 +128,11 @@ func run() error {
 	var google *auth.GoogleProvider
 	var oauthStore auth.OAuthStore
 	var devices auth.DevicesStore
-	if cfg.Auth.GoogleClientID != "" && cfg.Auth.GoogleClientSecret != "" && cfg.Auth.GoogleRedirectURL != "" && cfg.Auth.Mode == "local" {
+	if cfg.Auth.GoogleClientID != "" && cfg.Auth.GoogleClientSecret != "" && cfg.Auth.GoogleRedirectURL != "" {
 		google = auth.NewGoogleProvider(
 			cfg.Auth.GoogleClientID, cfg.Auth.GoogleClientSecret, cfg.Auth.GoogleRedirectURL,
 			cfg.Auth.GoogleAuthURL, cfg.Auth.GoogleTokenURL, cfg.Auth.GoogleJWKSURL, nil)
-		oauthUsers := repos.NewOAuthUsers(pg.Pool)
-		oauthStore = oauthUsers
+		oauthStore = repos.NewOAuthUsers(pg.Pool)
 		devices = repos.NewDevices(pg.Pool)
 		logger.Info("google sign-in enabled", "redirect", cfg.Auth.GoogleRedirectURL)
 	}
@@ -154,16 +145,6 @@ func run() error {
 		DeviceTTL:       cfg.Auth.DeviceTokenTTL,
 		RevocationCheck: cfg.Auth.RevocationCheck,
 
-		Registrar:         registrar,
-		Recovery:          recoveryStore,
-		Mail:              mailer,
-		RequireVerified:   cfg.Auth.RequireVerified,
-		VerifyTTL:         cfg.Auth.VerifyTokenTTL,
-		ResetTTL:          cfg.Auth.ResetTokenTTL,
-		ResendCooldown:    cfg.Auth.ResendCooldown,
-		MinPasswordLength: cfg.Auth.MinPasswordLength,
-		AppBaseURL:        cfg.Auth.AppBaseURL,
-
 		Google:         google,
 		OAuth:          oauthStore,
 		Devices:        devices,
@@ -173,26 +154,20 @@ func run() error {
 		DesktopCodeTTL: cfg.Auth.DesktopCodeTTL,
 	}
 	authMW := auth.Middleware{
-		Verifier: verifier, Resolver: resolver, Service: authSvc,
+		Verifier: signer, Resolver: resolver, Service: authSvc,
 		AuthTimeout: cfg.AuthTimeout, RevocationCheck: cfg.Auth.RevocationCheck,
 	}
 
-	// 7. Distributed rate limiting + idempotency.
+	// 7. Distributed rate limiting.
 	limiter := ratelimit.New(rd.Client, cfg.Rate.FailOpen, metrics)
-	idem := idempotency.New(rd.Client, cfg.IdempotencyTTL)
 
-	// 8. Metering (async, bounded, exactly-once).
-	meter := metering.New(usageRepo, metering.Config{
+	// 8. Metering (async, bounded, exactly-once via llm_calls.call_id).
+	meter := metering.New(calls, metering.Config{
 		QueueSize: cfg.Meter.QueueSize, BatchSize: cfg.Meter.BatchSize,
 		FlushInterval: cfg.Meter.FlushInterval, RetryMax: cfg.Meter.RetryMax,
 	}, metrics)
 
-	// 9. Event bus (replay streams + live fan-out).
-	bus := streaming.NewBus(rd.Client, streaming.Config{
-		MaxEventsPerRun: cfg.Replay.MaxEventsPerRun, Window: cfg.Replay.Window,
-	})
-
-	// 10. Bifrost client (shared transport, cloud-side credential only).
+	// 9. Bifrost client (shared transport, cloud-side credential only).
 	bf := bifrost.NewClient(bifrost.TransportConfig{
 		BaseURL: cfg.Bifrost.BaseURL, APIKey: cfg.Bifrost.APIKey,
 		DialTimeout: cfg.BifrostDialTimeout, TLSTimeout: cfg.BifrostTLSTimeout,
@@ -209,28 +184,31 @@ func run() error {
 		},
 	}, metrics)
 
-	// 11. Run manager + agent services.
-	mgr := agent.NewManager(rd.Client, limiter, cfg.Rate.RunConcurrencyTimeout, metrics)
-	runSvc := agent.NewService(agent.Config{
-		Sessions: sessionsRepo, Runs: runsRepo, Bifrost: bf, Bus: bus,
-		Meter: meter, Idem: idem, Manager: mgr, Limiter: limiter,
-		Limits: agent.Limits{
+	// 10. The LLM proxy (the tunnel service behind POST /v1/chat/completions).
+	//      Token accounting weights come from the token_normalization table
+	//      (hot-changeable via SQL; docs/TABLES.md) through a short-TTL cache.
+	proxy := &llm.Proxy{
+		Bifrost: bf, Meter: meter, Limiter: limiter, Usage: calls, Metrics: metrics,
+		Norm: llm.NewRuleCache(repos.NewNormalization(pg.Pool), cfg.NormCacheTTL),
+		Limits: llm.Limits{
 			MaxMessages: cfg.MaxMessages, MaxTools: cfg.MaxTools, MaxModelLen: cfg.MaxModelLen,
 		},
-		Rate: agent.RateRules{
+		Rate: llm.RateRules{
 			RPMUser: cfg.Rate.RequestsPerMinuteUser, RPMTenant: cfg.Rate.RequestsPerMinuteTenant,
-			ConcUser: cfg.Rate.ConcurrentRunsUser, ConcTenant: cfg.Rate.ConcurrentRunsTenant,
-			FailOpen: cfg.Rate.FailOpen,
+			ConcUser: cfg.Rate.ConcurrentRequestsUser, ConcTenant: cfg.Rate.ConcurrentRequestsTenant,
 		},
-		Timing:       agent.StreamTiming{IdleTimeout: cfg.StreamIdleTimeout, MaxDuration: cfg.StreamMaxDuration},
-		SetupTimeout: 15 * time.Second,
-		Metrics:      metrics,
-	})
-	sessSvc := agent.NewSessionService(sessionsRepo, cfg.SessionIdleTTL)
+		Timing: llm.Timing{
+			IdleTimeout: cfg.StreamIdleTimeout, MaxDuration: cfg.StreamMaxDuration,
+			NonStreamTimeout: cfg.BifrostReqTimeout,
+		},
+		SlotTTL: cfg.Rate.SlotTimeout,
+	}
 
-	// 11b. Payments (prepaid credit top-ups; docs/PAYMENT-GATEWAY.md).
+	// 11. Payments (plan purchases — plans only; docs/PAYMENT-GATEWAY.md).
 	// Provider modes: disabled (nil service, routes answer 503), mock
-	// (dev/tests, fixed secrets, no network), razorpay (production).
+	// (dev/tests, fixed secrets, no network), and the three production
+	// gateways — razorpay, stripe, phonepe — one active per deployment,
+	// selected by NEXAU_PAYMENT_PROVIDER.
 	var paySvc *payment.Service
 	var payProvider payment.Provider
 	switch cfg.Payments.Provider {
@@ -239,6 +217,19 @@ func run() error {
 			KeyID: cfg.Payments.RazorpayKeyID, KeySecret: cfg.Payments.RazorpayKeySecret,
 			WebhookSecret: cfg.Payments.RazorpayWebhookSecret,
 			BaseURL:       cfg.Payments.RazorpayAPIBase,
+		})
+	case "stripe":
+		payProvider = stripe.New(stripe.Config{
+			APIKey: cfg.Payments.StripeAPIKey, PublishableKey: cfg.Payments.StripePublishableKey,
+			WebhookSecret: cfg.Payments.StripeWebhookSecret,
+			BaseURL:       cfg.Payments.StripeAPIBase,
+		})
+	case "phonepe":
+		payProvider = phonepe.New(phonepe.Config{
+			MerchantID: cfg.Payments.PhonepeMerchantID, SaltKey: cfg.Payments.PhonepeSaltKey,
+			SaltIndex: cfg.Payments.PhonepeSaltIndex, RedirectURL: cfg.Payments.PhonepeRedirectURL,
+			RedirectMode: cfg.Payments.PhonepeRedirectMode, CallbackURL: cfg.Payments.PhonepeCallbackURL,
+			BaseURL: cfg.Payments.PhonepeAPIBase,
 		})
 	case "mock":
 		mock := payment.NewMockProvider()
@@ -262,11 +253,11 @@ func run() error {
 		})
 		paySvc.StartSweeper(rootCtx) // stops with rootCtx at shutdown
 		logger.Info("payments enabled", "provider", cfg.Payments.Provider,
-			"packs", len(paySvc.Packs()), "order_ttl", cfg.Payments.OrderTTL.String())
+			"skus", len(paySvc.SKUs()), "order_ttl", cfg.Payments.OrderTTL.String())
 	}
 
 	// 12. HTTP surface.
-	apiHandler := api.New(cfg, authSvc, authMW, sessSvc, runSvc, usageRepo, pg, rd, bf, meter, limiter, metrics, otel, paySvc)
+	apiHandler := api.New(cfg, authSvc, authMW, proxy, calls, pg, rd, bf, limiter, metrics, otel, paySvc)
 
 	chain := middleware.Chain(middleware.Options{
 		MaxBodyBytes: cfg.MaxBodyBytes, MaxInFlight: cfg.MaxConcurrentReqs,
@@ -284,14 +275,9 @@ func run() error {
 
 	// 13. Background housekeeping + metrics sampler.
 	hk := startHousekeeping(rootCtx, housekeepingDeps{
-		sessions: sessionsRepo, runs: runsRepo, refresh: refresh,
-		recovery: recovery,
-		pg:       pg, metrics: metrics, mgr: mgr,
-		stuckAfter:     cfg.StreamMaxDuration + 5*time.Minute,
-		sessionIdleTTL: cfg.SessionIdleTTL,
-		// Purge only applies in local mode (jwks deployments manage
-		// identities at the IdP and the repo is nil there).
-		unverifiedRetention: cfg.Auth.UnverifiedRetention,
+		refresh: refresh,
+		pg:      pg, metrics: metrics,
+		proxy: proxy,
 	}, logger)
 	defer hk.stop()
 
@@ -323,62 +309,27 @@ func run() error {
 	// past the operator's window.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer shutdownCancel()
-	deadline, _ := shutdownCtx.Deadline()
-	remaining := func() time.Duration {
-		r := time.Until(deadline)
-		if r < 0 {
-			r = 0
-		}
-		return r
-	}
 
-	// 14a. Stop accepting new connections.
+	// 14a. Stop accepting new connections. In-flight LLM streams observe the
+	// client side of the connection closing only after this returns.
 	_ = srv.Shutdown(shutdownCtx)
 
-	// 14b. Close WebSocket connections (1001 Going Away) — after Shutdown
-	// returns, hijacked connections are the only live handlers.
-	apiHandler.ShutdownWS()
+	// 14b. Drain the usage metering queue (bounded by the remaining grace):
+	// the last completed calls' llm_calls rows must land.
+	meter.Close(time.Until(deadlineOf(shutdownCtx)))
 
-	// 14c. Cancel remaining runs; producers finalize (usage, run rows).
-	mgr.Shutdown(remaining())
-
-	// 14d. Drain the usage metering queue (bounded by the remaining grace).
-	meter.Close(remaining())
-
-	// 14e. Flush telemetry.
+	// 14c. Flush telemetry.
 	otel.Shutdown(shutdownCtx)
 
-	// 14f-14g. Close Redis, then PostgreSQL (deferred above).
+	// 14d-14e. Close Redis, then PostgreSQL (deferred above).
 	logger.Info("shutdown complete")
 	return nil
 }
 
-// buildVerifier assembles the token verifier per auth mode.
-func buildVerifier(cfg *config.Config) (auth.Verifier, *auth.LocalSigner, error) {
-	local := auth.NewLocalSigner(cfg.Auth.HS256Secret, cfg.Auth.Issuer, cfg.Auth.Audience,
-		cfg.Auth.Leeway, cfg.Auth.AccessTokenTTL)
-	jwks := auth.NewJWKSVerifier(cfg.Auth.JWKSURL, cfg.Auth.Issuer, cfg.Auth.Audience,
-		cfg.Auth.JWKSRefresh, cfg.Auth.JWKSMinRefresh, cfg.Auth.Leeway, http.DefaultClient)
-	switch cfg.Auth.Mode {
-	case "local":
-		return local, local, nil
-	case "jwks":
-		return jwks, nil, nil
-	default:
-		return nil, nil, errors.New("config: unsupported auth mode " + cfg.Auth.Mode)
+func deadlineOf(ctx context.Context) time.Time {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return time.Now().Add(30 * time.Second)
 	}
-}
-
-// buildMailer selects the transactional-mail backend. The "log" default emits
-// metadata-only events (never the credential link — 2026-09-19 audit, finding
-// 2); NEXAU_MAIL_LOG_LINKS=true re-enables link logging for local development.
-func buildMailer(cfg *config.Config) auth.Mailer {
-	if cfg.Mail.Mode != "smtp" {
-		return auth.LogMailer{LogLinks: cfg.Mail.LogLinks}
-	}
-	return auth.SMTPMailer{
-		Host: cfg.Mail.Host, Port: cfg.Mail.Port,
-		Username: cfg.Mail.Username, Password: cfg.Mail.Password,
-		From: cfg.Mail.From, SSL: cfg.Mail.SSL,
-	}
+	return dl
 }

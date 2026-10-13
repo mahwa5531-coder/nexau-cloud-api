@@ -17,8 +17,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/nexau-cloud/nexau-api/internal/observability"
-	"github.com/nexau-cloud/nexau-api/internal/store"
+	"github.com/mash-cloud/mash-api/internal/observability"
+	"github.com/mash-cloud/mash-api/internal/store"
 )
 
 // Verdict is the outcome of a limit check.

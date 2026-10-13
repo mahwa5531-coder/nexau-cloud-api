@@ -9,9 +9,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/nexau-cloud/nexau-api/internal/domain"
-	"github.com/nexau-cloud/nexau-api/internal/store"
-	"github.com/nexau-cloud/nexau-api/internal/store/repos"
+	"github.com/mash-cloud/mash-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/store"
+	"github.com/mash-cloud/mash-api/internal/store/repos"
 )
 
 // IdentityResolver turns verified claims into the full server-authoritative
@@ -95,7 +95,7 @@ func (r *IdentityResolver) load(ctx context.Context, userID, tenantID string) (*
 
 	id := &Identity{
 		User: UserInfo{
-			ID: u.ID, Email: u.Email, DisplayName: u.DisplayName,
+			ID: u.ID, Email: u.Email, DisplayName: u.DisplayName, AvatarURL: u.AvatarURL,
 			Status: u.Status, IsPlatformAdmin: u.IsPlatformAdmin,
 			EmailVerified: u.EmailVerified,
 		},
@@ -107,32 +107,47 @@ func (r *IdentityResolver) load(ctx context.Context, userID, tenantID string) (*
 	if err != nil {
 		return nil, store.MapDBError(err)
 	}
+
+	// FREE-PLAN DEFAULT: a tenant without an effective (paid, unexpired)
+	// subscription is not plan-less-and-unbounded — it falls back to the
+	// 'free' plan's limits + model allowlist. Plans only: Free is what you
+	// are until you buy Pro; expiry returns you here automatically.
+	var planLimits domain.PlanLimits
+	var planInfo PlanInfo
+	var planModels []string
 	if sub != nil {
 		id.SubscriptionStatus = sub.Status
+		planInfo = PlanInfo{ID: sub.Plan.ID, Code: sub.Plan.Code, Name: sub.Plan.Name}
+		planLimits = sub.Plan.Limits
+		planModels = sub.Plan.Models
+	} else if fp, ferr := r.Subs.PlanByCode(ctx, "free"); ferr == nil && fp != nil {
+		id.SubscriptionStatus = "none"
+		planInfo = PlanInfo{ID: fp.ID, Code: fp.Code, Name: fp.Name}
+		planLimits = fp.Limits
+		planModels = fp.Models
+	} else if ferr != nil {
+		return nil, store.MapDBError(ferr)
+	}
+	if planInfo.Code != "" {
+		id.Plan = planInfo
 		id.Limits = Limits{
-			RequestsPerMinuteUser:   sub.Plan.Limits.RequestsPerMinuteUser,
-			RequestsPerMinuteTenant: sub.Plan.Limits.RequestsPerMinuteTenant,
-			ConcurrentRunsUser:      sub.Plan.Limits.ConcurrentRunsUser,
-			ConcurrentRunsTenant:    sub.Plan.Limits.ConcurrentRunsTenant,
-			MaxRequestBytes:         sub.Plan.Limits.MaxRequestBytes,
-			MonthlyTokenQuota:       sub.Plan.Limits.MonthlyTokenQuota,
+			RequestsPerMinuteUser:    planLimits.RequestsPerMinuteUser,
+			RequestsPerMinuteTenant:  planLimits.RequestsPerMinuteTenant,
+			ConcurrentRequestsUser:   planLimits.ConcurrentRequestsUser,
+			ConcurrentRequestsTenant: planLimits.ConcurrentRequestsTenant,
+			MaxRequestBytes:          planLimits.MaxRequestBytes,
+			Window5hTokens:           planLimits.Window5hTokens,
+			WindowWeeklyTokens:       planLimits.WindowWeeklyTokens,
 		}
 	}
 
-	models, restricted, err := r.Ents.ModelsAllowlist(ctx, tenantID, subPlanModels(sub))
+	models, restricted, err := r.Ents.ModelsAllowlist(ctx, tenantID, planModels)
 	if err != nil {
 		return nil, store.MapDBError(err)
 	}
 	id.Models = models
 	id.Restricted = restricted
 	return id, nil
-}
-
-func subPlanModels(sub *domain.Subscription) []string {
-	if sub == nil {
-		return nil
-	}
-	return sub.Plan.Models
 }
 
 func identityCacheKey(userID, tenantID string) string {
@@ -146,7 +161,3 @@ func (r *IdentityResolver) Invalidate(ctx context.Context, userID, tenantID stri
 	}
 	r.Redis.Del(ctx, identityCacheKey(userID, tenantID))
 }
-
-// BumpVersion is a no-op placeholder for future cache-versioning; TTL bounds
-// staleness to CacheTTL today.
-func (r *IdentityResolver) BumpVersion(ctx context.Context, userID string) {}

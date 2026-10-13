@@ -1,6 +1,6 @@
 # Desktop ↔ Cloud API ↔ Bifrost — The Single Connection Document
 
-> **Scope.** This is the one document that answers: *how does the NexAU desktop
+> **Scope.** This is the one document that answers: *how does the MASh desktop
 > application connect to the cloud, and how does that relate to Bifrost?*
 > Everything here is stated from **verified code in this repository** (file
 > paths cited) or from **the desktop team's own written spec** (labelled as
@@ -24,7 +24,7 @@ machine — that is what "fully managed, not BYOK" means in the wire topology:
 ```
 ┌──────────────────────┐   HTTPS + user JWT   ┌──────────────────────┐  internal HTTP + 1 key  ┌──────────┐
 │  NexaU Desktop app   │ ───────────────────> │  NexaU Cloud API     │ ─────────────────────> │ Bifrost  │──> 23+ LLMs
-│  (local, user PC)   │    SSE / WebSocket    │  (stateless, N pods) │  POST /v1/chat/         │ (gateway)│
+│  (local, user PC)   │        SSE / POST     │  (stateless, N pods) │  POST /v1/chat/         │ (gateway)│
 └──────────────────────┘                      └──────────────────────┘  completions             └──────────┘
   holds: access + refresh        ▲                     ▲                                       ▲
   tokens only (DPAPI vault)      │                     │                                       │
@@ -59,19 +59,20 @@ machine — that is what "fully managed, not BYOK" means in the wire topology:
   unnecessary.
 - **CORS/origins**: CORS is a browser concept; a native desktop HTTP client
   needs **no** origin allow-list. `NEXAU_ALLOWED_ORIGINS` exists only for the
-  Next.js dev UI and WebSocket browsers.
-- **Streaming**: two transports, both first-class:
-  - **SSE**: `POST /v1/agent/sessions/{session_id}/runs` with `stream:true` →
-    AG-UI event envelopes (`internal/api/runs.go`, `internal/streaming/sse.go`).
-  - **WebSocket**: `GET /v1/agent/sessions/{session_id}/stream` with
-    `run.create` / `run.cancel` / `resume` / `ack` / `ping` frames
-    (`internal/streaming/websocket.go`). Reconnect + resume works from **any**
-    API replica: events live in a bounded Redis Stream per run; the client
-    resumes by `last_sequence`.
-- **Compatibility surface**: `POST /v1/agent/chat/completions` is an
-  OpenAI-compatible pass-through (raw provider SSE bytes) — any existing
-  OpenAI-style client works by changing only the base URL and using the NexaU
-  access token instead of an OpenAI key.
+  web dev UI.
+- **Streaming**: ONE transport — SSE:
+  - `POST /v1/chat/completions` with `stream:true` → OpenAI chat-completions
+    chunks forwarded **verbatim** (`internal/api/llm.go`, `internal/llm/sse.go`).
+  - The terminal event is `data: [DONE]`; comment heartbeats (`: ping`) keep
+    intermediaries alive; mid-stream upstream failures surface as one
+    in-band `{"error":{…}}` event before `[DONE]`.
+  - Canceling a stream = closing the connection: the cloud cancels the
+    upstream request through context propagation (no cancel endpoint, no
+    resume protocol — the desktop owns replay from its local transcript).
+- **OpenAI-compatible surface**: `POST /v1/chat/completions` is the ONLY LLM
+  endpoint. Any existing OpenAI-style client works by changing the base URL,
+  using `"provider/model"` model ids and the MASh access token instead of an
+  OpenAI key.
 
 ### 2.1 What the desktop sends vs. what it must never invent
 
@@ -215,18 +216,16 @@ channel), `ACCOUNT_INACTIVE`, `VALIDATION_ERROR`.
 
 ### 5.6 Runtime (authed) — the calls after login
 ```jsonc
-GET  /v1/me                                   // server-authoritative identity, limits, models
-GET  /v1/config                               // limits, endpoints, timing for the client
-POST /v1/agent/sessions                       // open a session
-POST /v1/agent/sessions/{id}/runs             // create a run; "stream": true → SSE
-GET  /v1/agent/sessions/{id}/stream            // WebSocket (run.create / resume / ack / ping)
-POST /v1/agent/runs/{id}/cancel               // cancel anywhere in the fleet
-GET  /v1/agent/runs/{id}                      // status → resume decisions
-GET  /v1/usage?from&to&by_model               // tenant usage aggregates
+GET   /v1/me                                  // server-authoritative identity, limits, quota, models
+GET   /v1/config                              // limits, endpoint contract, stream timing
+POST  /v1/chat/completions                    // THE LLM call (stream:true → SSE; OpenAI-compatible)
+GET   /v1/usage?from&to&by_model              // tenant usage aggregates
 ```
-Event envelope (AG-UI, transport-neutral): `event_id`, `session_id`, `run_id`,
-`sequence` (monotonic, gap-free), `type` (`TEXT_MESSAGE_*`, `TOOL_CALL_*`,
-`RUN_*`, `USAGE_UPDATE`, `MODEL_CALL_FINISHED`), `timestamp`, `data`.
+Wire format: plain OpenAI chat-completions chunks, forwarded verbatim
+(`choices[].delta`, usage in the final chunk, `data: [DONE]` terminator).
+Sessions, runs and their transcripts are DESKTOP-LOCAL — there is no
+`/v1/agent/*` surface anymore, and no resume protocol (replay from the local
+transcript; the cloud buffers nothing).
 
 ---
 
@@ -248,7 +247,7 @@ profile`. ID tokens are verified against Google's JWKS (RS256; `iss`/`aud`/
 `exp` checked) — unverified provider emails never create accounts.
 
 First Google sign-in provisions **user + personal tenant + owner membership +
-free-plan trial atomically**; a later password signup with the same email is
+free-plan trial atomically**; the identity anchor is the Google `sub`
 **linked, not duplicated** (`internal/store/repos/oauth.go`,
 `FindOrCreateGoogleUser`).
 
@@ -287,7 +286,7 @@ each row maps to a **finished, tested** cloud endpoint above.
       existing `ensure_valid_token()` sliding refresh pointed at
       `POST /v1/auth/refresh` (persist the **new** pair atomically per call).
 - [ ] **Run/stream clients**: SSE consumer for
-      `POST …/runs` (`stream:true`) and/or the WebSocket client with
+      `POST /v1/chat/completions` (`stream:true`) and
       `resume{run_id, last_sequence}` reconnect logic.
 - [ ] **Startup entitlement fetch**: `GET /v1/config` once at boot; obey the
       returned limits/timeouts instead of hard-coding.
@@ -302,9 +301,8 @@ each row maps to a **finished, tested** cloud endpoint above.
 | User lingered > 60 s | same code | web page mints a fresh mcode; retry with the new one |
 | Access token expired | 401 `UNAUTHORIZED` | refresh; retry once; if refresh fails → vault clear → login again |
 | Refresh token reused (rotation race) | family revoked; 401s | full re-login (this is the theft-detection working) |
-| **Token revoked while a WS is live (logout elsewhere, 2026-09-19)** | WS close **1008** `authorization no longer valid` on the next heartbeat (≤ a few seconds) | the same token is also 401 on HTTP — treat as forced logout: clear the vault, require re-login |
-| **WS outlived the access token (2026-09-19)** | same WS close **1008** after token expiry + 30 s grace | refresh and reconnect with the fresh token, then `resume{run_id, last_sequence}` — in-flight runs were cancelled at close |
-| Stream dropped | WS close 1011 / `RESYNC_REQUIRED` | reconnect to any replica, `resume{run_id, last_sequence}` |
+| **Token revoked mid-stream (logout elsewhere)** | stream ends; the next HTTP call is 401 `TOKEN_REVOKED` | treat as forced logout: clear the vault, require re-login |
+| **Stream dropped (network blip)** | SSE read returns EOF / error | the call is over: the cloud canceled the upstream and metered it `cancelled`; replay from the local transcript and retry as a NEW request |
 | Rate limited | 429 + `Retry-After` | honor the header; never hammer |
 | Redis/PG degraded (rare) | 503 `DEPENDENCY_UNAVAILABLE` | back off with jitter |
 | Bifrost gateway failing (cloud protects itself) | 503 `UPSTREAM_CIRCUIT_OPEN`, `details.retry_after_ms` present | back off for `retry_after_ms` (typically seconds); the cloud auto-recovers — probe after the hint, no user action needed |

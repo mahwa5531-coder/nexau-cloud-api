@@ -30,7 +30,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/nexau-cloud/nexau-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/domain"
 )
 
 // desktopCodeRe pins the wire format: mcode_ + 64 lowercase hex chars.

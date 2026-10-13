@@ -1,31 +1,26 @@
 // Package api assembles the HTTP surface: route table, JSON encoding,
-// auth-wrapped handlers and the stream transports. Handlers are thin: they
+// auth-wrapped handlers and the SSE stream transport. Handlers are thin: they
 // decode, delegate to services, and encode — business rules never live here.
 package api
 
 import (
-	"bufio"
 	"encoding/json"
-	"fmt"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/nexau-cloud/nexau-api/internal/agent"
-	"github.com/nexau-cloud/nexau-api/internal/auth"
-	"github.com/nexau-cloud/nexau-api/internal/bifrost"
-	"github.com/nexau-cloud/nexau-api/internal/config"
-	"github.com/nexau-cloud/nexau-api/internal/domain"
-	"github.com/nexau-cloud/nexau-api/internal/metering"
-	"github.com/nexau-cloud/nexau-api/internal/middleware"
-	"github.com/nexau-cloud/nexau-api/internal/observability"
-	"github.com/nexau-cloud/nexau-api/internal/payment"
-	"github.com/nexau-cloud/nexau-api/internal/ratelimit"
-	"github.com/nexau-cloud/nexau-api/internal/store"
-	"github.com/nexau-cloud/nexau-api/internal/store/repos"
-	"github.com/nexau-cloud/nexau-api/internal/streaming"
+	"github.com/mash-cloud/mash-api/internal/auth"
+	"github.com/mash-cloud/mash-api/internal/bifrost"
+	"github.com/mash-cloud/mash-api/internal/config"
+	"github.com/mash-cloud/mash-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/llm"
+	"github.com/mash-cloud/mash-api/internal/middleware"
+	"github.com/mash-cloud/mash-api/internal/observability"
+	"github.com/mash-cloud/mash-api/internal/payment"
+	"github.com/mash-cloud/mash-api/internal/ratelimit"
+	"github.com/mash-cloud/mash-api/internal/store"
+	"github.com/mash-cloud/mash-api/internal/store/repos"
 )
 
 // API holds the handler dependencies.
@@ -33,18 +28,15 @@ type API struct {
 	cfg      *config.Config
 	authSvc  *auth.Service
 	authMW   auth.Middleware
-	sessions *agent.SessionService
-	runs     *agent.Service
-	usage    *repos.UsageRepo
+	proxy    *llm.Proxy
+	usage    *repos.LLMCallsRepo
 	pg       *store.Postgres
 	redis    *store.Redis
 	bifrost  *bifrost.Client
-	meter    *metering.Recorder
 	lim      *ratelimit.Limiter
 	metrics  *observability.Metrics
 	otel     *observability.OTel
 	payments *payment.Service
-	upgrader *streaming.Upgrader
 }
 
 // New builds the API.
@@ -52,41 +44,40 @@ func New(
 	cfg *config.Config,
 	authSvc *auth.Service,
 	authMW auth.Middleware,
-	sessions *agent.SessionService,
-	runs *agent.Service,
-	usage *repos.UsageRepo,
+	proxy *llm.Proxy,
+	usage *repos.LLMCallsRepo,
 	pg *store.Postgres,
 	rd *store.Redis,
 	bf *bifrost.Client,
-	meter *metering.Recorder,
 	lim *ratelimit.Limiter,
 	metrics *observability.Metrics,
 	otel *observability.OTel,
 	payments *payment.Service,
 ) *API {
 	return &API{
-		cfg: cfg, authSvc: authSvc, authMW: authMW, sessions: sessions, runs: runs,
-		usage: usage, pg: pg, redis: rd, bifrost: bf, meter: meter, lim: lim,
+		cfg: cfg, authSvc: authSvc, authMW: authMW, proxy: proxy,
+		usage: usage, pg: pg, redis: rd, bifrost: bf, lim: lim,
 		metrics: metrics, otel: otel, payments: payments,
-		upgrader: streaming.NewUpgrader(streaming.WSConfig{
-			HeartbeatInterval: cfg.WSHeartbeatInterval,
-			WriteWait:         cfg.WSWriteWait,
-			MaxMessageSize:    cfg.WSMaxMessageSize,
-			SendQueue:         cfg.WSSendQueue,
-			SlowConsumerGrace: cfg.WSSlowConsumerGrace,
-			IdleTimeout:       cfg.WSIdleTimeout,
-		}, cfg.AllowedOrigins, metrics),
-	}
-}
-
-// ShutdownWS closes all live WebSocket connections (graceful shutdown).
-func (a *API) ShutdownWS() {
-	if a.upgrader != nil {
-		a.upgrader.Shutdown()
 	}
 }
 
 // Router builds the full route table (Go 1.22+ pattern routing).
+//
+// Surface (14 routes + health/metrics):
+//
+//	POST /v1/auth/refresh               rotate the desktop token pair
+//	POST /v1/auth/logout                revoke one refresh token
+//	POST /v1/auth/logout-all            revoke every session (lost device)
+//	GET  /v1/auth/oauth/google          begin "Continue with Google" (302)
+//	GET  /v1/auth/oauth/google/callback finish OAuth → web success page
+//	POST /v1/auth/web/session           grant → short web access token
+//	POST /v1/auth/desktop/code          (authed) mint single-use mcode
+//	POST /v1/auth/desktop/exchange      mcode → full desktop TokenPair
+//	GET  /v1/me                         identity + plan + quota position
+//	GET  /v1/config                     client integration config
+//	POST /v1/chat/completions           THE LLM endpoint (SSE tunnel to Bifrost)
+//	GET  /v1/usage                      usage aggregation window
+//	POST /v1/payments/*                 plan purchases (PhonePe default)
 func (a *API) Router() http.Handler {
 	mux := http.NewServeMux()
 
@@ -97,34 +88,19 @@ func (a *API) Router() http.Handler {
 		mux.Handle("GET /metrics", a.otel.PromHandler)
 	}
 
-	// Auth.
+	// Auth (Google OAuth is the only identity provider).
 	mux.HandleFunc("POST /v1/auth/refresh", a.handleRefresh)
-	if a.cfg.Auth.LoginEnabled {
-		mux.HandleFunc("POST /v1/auth/login", a.handleLogin)
-	}
 	mux.Handle("POST /v1/auth/logout", a.authMW.Require(http.HandlerFunc(a.handleLogout)))
-
-	// Signup & account recovery (local mode only; jwks deployments manage
-	// identities at the IdP — config validation force-disables this).
-	if a.cfg.Auth.SignupEnabled {
-		mux.HandleFunc("POST /v1/auth/register", a.handleRegister)
-		mux.HandleFunc("POST /v1/auth/email/verify", a.handleVerifyEmail)
-		mux.HandleFunc("POST /v1/auth/email/resend", a.handleResendVerification)
-		mux.HandleFunc("POST /v1/auth/password/forgot", a.handleForgotPassword)
-		mux.HandleFunc("POST /v1/auth/password/reset", a.handleResetPassword)
-		mux.Handle("POST /v1/auth/password/change", a.authMW.Require(http.HandlerFunc(a.handleChangePassword)))
-	}
+	mux.Handle("POST /v1/auth/logout-all", a.authMW.Require(http.HandlerFunc(a.handleLogoutAll)))
 
 	// Google OAuth + web-to-desktop handshake. The OAuth pair mounts only
 	// when the provider is fully configured (main.go leaves Service.Google
-	// nil otherwise); the JSON endpoints require a local signer (jwks-only
-	// deployments mint nothing to exchange).
+	// nil otherwise); the JSON endpoints require the local signer.
 	if a.authSvc != nil && a.authSvc.Google != nil {
 		mux.HandleFunc("GET /v1/auth/oauth/google", a.handleGoogleOAuthBegin)
 		mux.HandleFunc("GET /v1/auth/oauth/google/callback", a.handleGoogleOAuthCallback)
 	}
 	if a.authSvc != nil && a.authSvc.Signer != nil {
-		mux.HandleFunc("POST /v1/auth/lookup", a.handleAuthLookup)
 		mux.HandleFunc("POST /v1/auth/web/session", a.handleWebSession)
 		mux.Handle("POST /v1/auth/desktop/code", a.authMW.Require(http.HandlerFunc(a.handleDesktopCode)))
 		mux.HandleFunc("POST /v1/auth/desktop/exchange", a.handleDesktopExchange)
@@ -134,33 +110,23 @@ func (a *API) Router() http.Handler {
 	mux.Handle("GET /v1/me", a.authMW.Require(http.HandlerFunc(a.handleMe)))
 	mux.Handle("GET /v1/config", a.authMW.Require(http.HandlerFunc(a.handleClientConfig)))
 
-	// Sessions.
-	mux.Handle("POST /v1/agent/sessions", a.authMW.Require(http.HandlerFunc(a.handleCreateSession)))
-	mux.Handle("GET /v1/agent/sessions/{session_id}", a.authMW.Require(http.HandlerFunc(a.handleGetSession)))
-	mux.Handle("DELETE /v1/agent/sessions/{session_id}", a.authMW.Require(http.HandlerFunc(a.handleCloseSession)))
-
-	// Runs.
-	mux.Handle("POST /v1/agent/sessions/{session_id}/runs", a.authMW.Require(http.HandlerFunc(a.handleCreateRun)))
-	mux.Handle("GET /v1/agent/runs/{run_id}", a.authMW.Require(http.HandlerFunc(a.handleGetRun)))
-	mux.Handle("POST /v1/agent/runs/{run_id}/cancel", a.authMW.Require(http.HandlerFunc(a.handleCancelRun)))
-	mux.HandleFunc("GET /v1/agent/sessions/{session_id}/stream", a.handleSessionStream)
-
-	// Raw OpenAI-compatible surface (implicit session).
-	mux.Handle("POST /v1/agent/chat/completions", a.authMW.Require(http.HandlerFunc(a.handleChatCompletions)))
+	// The LLM endpoint: OpenAI-compatible tunnel to the private Bifrost
+	// gateway (agent runtime lives on the desktop; this is its model access).
+	mux.Handle("POST /v1/chat/completions", a.authMW.Require(http.HandlerFunc(a.handleChatCompletions)))
 
 	// Usage.
 	mux.Handle("GET /v1/usage", a.authMW.Require(http.HandlerFunc(a.handleUsage)))
 
-	// Payments (credit top-ups). Routes mount regardless of provider
-	// mode: disabled deployments answer 503 PAYMENTS_DISABLED, keeping
-	// the client contract stable across deployments.
+	// Payments (plan purchases — plans only, no credit packs). Routes
+	// mount regardless of provider mode: disabled deployments answer
+	// 503 PAYMENTS_DISABLED, keeping the client contract stable.
 	mux.HandleFunc("POST /v1/payments/webhook", a.handlePaymentWebhook)
 	mux.Handle("GET /v1/payments/catalog", a.authMW.Require(http.HandlerFunc(a.handlePaymentCatalog)))
 	mux.Handle("POST /v1/payments/checkout", a.authMW.Require(http.HandlerFunc(a.handlePaymentCheckout)))
 	mux.Handle("POST /v1/payments/confirm", a.authMW.Require(http.HandlerFunc(a.handlePaymentConfirm)))
 	mux.Handle("GET /v1/payments/orders/{order_id}", a.authMW.Require(http.HandlerFunc(a.handlePaymentOrder)))
 	mux.Handle("GET /v1/payments/history", a.authMW.Require(http.HandlerFunc(a.handlePaymentHistory)))
-	mux.Handle("GET /v1/payments/balance", a.authMW.Require(http.HandlerFunc(a.handlePaymentBalance)))
+	mux.Handle("GET /v1/payments/subscription", a.authMW.Require(http.HandlerFunc(a.handlePaymentSubscription)))
 
 	return a.wrapMux(mux)
 }
@@ -197,19 +163,11 @@ func (a *API) wrapMux(mux *http.ServeMux) http.Handler {
 }
 
 func isStreamPath(p string) bool {
-	return strings.HasSuffix(p, "/runs") || strings.HasSuffix(p, "/stream") ||
-		strings.HasSuffix(p, "/chat/completions")
+	return strings.HasSuffix(p, "/chat/completions")
 }
 
 func routeLabel(r *http.Request) string {
 	p := r.URL.Path
-	parts := strings.Split(p, "/")
-	for i, part := range parts {
-		if strings.HasPrefix(part, "sess_") || strings.HasPrefix(part, "run_") {
-			parts[i] = "{id}"
-		}
-	}
-	p = strings.Join(parts, "/")
 	if len(p) > 72 {
 		p = p[:72]
 	}
@@ -232,16 +190,6 @@ func (w *respStatus) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
-}
-
-// Hijack passes the connection through for WebSocket upgrades: the wrapper
-// must be transparent, or the upgrade 500s.
-func (w *respStatus) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hj, ok := w.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, fmt.Errorf("respStatus: underlying writer is not a hijacker")
-	}
-	return hj.Hijack()
 }
 
 // Unwrap lets http.ResponseController (SSE write deadlines) reach the real
@@ -274,4 +222,11 @@ func decodeJSON(r *http.Request, v any) error {
 		return errTrailingJSON{}
 	}
 	return nil
+}
+
+func jsonErrText(err error) string {
+	if err == error(errTrailingJSON{}) {
+		return "trailing content after the JSON body"
+	}
+	return err.Error()
 }
