@@ -15,6 +15,8 @@ import (
 	"github.com/mash-cloud/mash-api/internal/observability"
 	"github.com/mash-cloud/mash-api/internal/ratelimit"
 	"github.com/mash-cloud/mash-api/internal/reqctx"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // BifrostClient is the upstream seam (implemented by bifrost.Client).
@@ -63,6 +65,9 @@ type Proxy struct {
 	// token_normalization table; nil = built-in identity accounting).
 	Norm *RuleCache
 
+	Redis         redis.UniversalClient
+	UsageCacheTTL time.Duration // ponytail: 5s default shields PG from rapid agentic bursts
+
 	Limits  Limits
 	Rate    RateRules
 	Timing  Timing
@@ -79,6 +84,7 @@ func rpmUserKey(uid string) string    { return "rl:rpm:user:" + uid }
 func rpmTenantKey(tid string) string  { return "rl:rpm:tenant:" + tid }
 func concUserKey(uid string) string   { return "rl:conc:user:" + uid }
 func concTenantKey(tid string) string { return "rl:conc:tenant:" + tid }
+func windowUsageKey(tid string) string { return "usage:window:" + tid }
 
 // Sink forwards upstream SSE payloads verbatim to the client. One method per
 // frame class; implemented by the HTTP transport (api/llm.go).
@@ -350,14 +356,15 @@ func (p *Proxy) admit(ctx context.Context, idn *auth.Identity, req *Request) (fu
 	// point of consumption. Query failure fails OPEN (availability posture;
 	// the quota gate is a plan-abuse bound, not a security boundary).
 	// Under-metering is the visible, correctable failure mode.
-	if (idn.Limits.Window5hTokens > 0 || idn.Limits.WindowWeeklyTokens > 0) && p.Usage != nil {
-		pos, err := p.Usage.WindowUsage(ctx, idn.Tenant.ID)
-		if err == nil {
-			if q := idn.Limits.Window5hTokens; q > 0 && pos.Used5h >= q {
-				return nil, p.windowBlocked(ctx, idn, "5h", 5*time.Hour, q, pos.Used5h)
+	q5h, qWeekly := idn.Limits.Window5hTokens, idn.Limits.WindowWeeklyTokens
+	if (q5h > 0 || qWeekly > 0) && p.Usage != nil {
+		pos, err := p.windowUsage(ctx, idn.Tenant.ID, q5h, qWeekly)
+		if err == nil && pos != nil {
+			if q5h > 0 && pos.Used5h >= q5h {
+				return nil, p.windowBlocked(ctx, idn, "5h", 5*time.Hour, q5h, pos.Used5h)
 			}
-			if q := idn.Limits.WindowWeeklyTokens; q > 0 && pos.UsedWeekly >= q {
-				return nil, p.windowBlocked(ctx, idn, "weekly", 7*24*time.Hour, q, pos.UsedWeekly)
+			if qWeekly > 0 && pos.UsedWeekly >= qWeekly {
+				return nil, p.windowBlocked(ctx, idn, "weekly", 7*24*time.Hour, qWeekly, pos.UsedWeekly)
 			}
 		}
 	}
@@ -487,6 +494,9 @@ func NormalizeUsage(u *bifrost.Usage, rule domain.NormRule) *domain.TokenUsage {
 	}
 	if u.PromptTokensDetails != nil {
 		t.CacheReadTokens = u.PromptTokensDetails.CachedReadTokens
+		if t.CacheReadTokens == 0 && u.PromptTokensDetails.CachedTokens > 0 {
+			t.CacheReadTokens = u.PromptTokensDetails.CachedTokens
+		}
 		t.CacheWriteTokens = u.PromptTokensDetails.CachedWriteTokens
 	}
 	if u.CompletionDetails != nil {
@@ -541,4 +551,50 @@ func safeMessage(de *domain.Error) string {
 		return "upstream error"
 	}
 	return de.Message
+}
+
+
+func (p *Proxy) windowUsage(ctx context.Context, tenantID string, q5h, qWeekly int64) (*domain.WindowUsage, error) {
+	if p.Usage == nil {
+		return nil, nil
+	}
+	cacheTTL := p.UsageCacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = 5 * time.Second // ponytail: 5s default cache shields Postgres from rapid agent turns
+	}
+
+	// 1. Redis cache lookup (best-effort; Redis down or nil -> straight to PostgreSQL)
+	if p.Redis != nil {
+		if blob, err := p.Redis.Get(ctx, windowUsageKey(tenantID)).Bytes(); err == nil {
+			var u domain.WindowUsage
+			if json.Unmarshal(blob, &u) == nil {
+				// Safety: if cached value is near or over quota (>=95%), bypass and check fresh DB
+				near5h := q5h > 0 && u.Used5h >= q5h*95/100
+				nearWeekly := qWeekly > 0 && u.UsedWeekly >= qWeekly*95/100
+				if !near5h && !nearWeekly {
+					return &u, nil
+				}
+			}
+		}
+	}
+
+	// 2. Authoritative database query
+	pos, err := p.Usage.WindowUsage(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Cache fill: only cache safe (under-quota) positions so recovery is immediate
+	if p.Redis != nil && pos != nil {
+		over5h := q5h > 0 && pos.Used5h >= q5h
+		overWeekly := qWeekly > 0 && pos.UsedWeekly >= qWeekly
+		if !over5h && !overWeekly {
+			if blob, err := json.Marshal(pos); err == nil {
+				_ = p.Redis.Set(ctx, windowUsageKey(tenantID), blob, cacheTTL).Err()
+			}
+		} else {
+			_ = p.Redis.Del(ctx, windowUsageKey(tenantID)).Err()
+		}
+	}
+	return pos, nil
 }

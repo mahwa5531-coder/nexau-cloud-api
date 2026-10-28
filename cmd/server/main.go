@@ -218,6 +218,7 @@ func run() error {
 	proxy := &llm.Proxy{
 		Bifrost: bf, Meter: meter, Limiter: limiter, Usage: calls, Metrics: metrics,
 		Norm: llm.NewRuleCache(repos.NewNormalization(pg.Pool), cfg.NormCacheTTL),
+		Redis: rd.Client, UsageCacheTTL: 5 * time.Second,
 		Limits: llm.Limits{
 			MaxMessages: cfg.MaxMessages, MaxTools: cfg.MaxTools, MaxModelLen: cfg.MaxModelLen,
 		},

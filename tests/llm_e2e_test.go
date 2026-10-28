@@ -238,6 +238,7 @@ func newEnv(t *testing.T) *env {
 	bfClient := bifrost.NewClient(bifrost.TransportConfig{BaseURL: fb.srv.URL}, metrics)
 	proxy := &llm.Proxy{
 		Bifrost: bfClient, Meter: recorder, Limiter: limiter, Usage: usage, Metrics: metrics,
+		Redis: rdb, UsageCacheTTL: 5 * time.Second,
 		Limits: llm.Limits{MaxMessages: 32, MaxTools: 16, MaxModelLen: 128},
 		Rate:   llm.RateRules{RPMUser: 600, RPMTenant: 6000, ConcUser: 16, ConcTenant: 256},
 		Timing: llm.Timing{

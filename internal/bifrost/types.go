@@ -227,6 +227,7 @@ type PromptTokensDetails struct {
 	AudioTokens       int64 `json:"audio_tokens,omitempty"`
 	ImageTokens       int64 `json:"image_tokens,omitempty"`
 	CachedReadTokens  int64 `json:"cached_read_tokens,omitempty"`
+	CachedTokens      int64 `json:"cached_tokens,omitempty"`
 	CachedWriteTokens int64 `json:"cached_write_tokens,omitempty"`
 }
 
