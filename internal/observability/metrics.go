@@ -113,60 +113,79 @@ func Attr(k, v string) attribute.KeyValue { return attribute.String(k, v) }
 
 // Metrics is the central instrument registry. Fields are nil-safe wrappers.
 type Metrics struct {
-	HTTPRequests           *Counter   // http.requests{route,status,method}
-	HTTPDurationMS         *Histogram // http.duration_ms{route}
-	ActiveRequests         *Gauge     // http.active_requests
-	ActiveStreams          *Gauge     // stream.active
-	EventsForwarded        *Counter   // stream.events_forwarded{type}
-	CallsCompleted         *Counter   // llm.calls_completed{status}
-	BifrostRequests        *Counter   // bifrost.requests{status}
-	BifrostDurationMS      *Histogram // bifrost.duration_ms
-	BifrostStreamEvents    *Counter   // bifrost.stream_chunks
-	BifrostBreakerState    *Gauge     // bifrost.breaker_state (0 closed, 1 half-open, 2 open)
-	BifrostBreakerTrips    *Counter   // bifrost.breaker_trips{reason}
-	BifrostBreakerRejected *Counter   // bifrost.breaker_rejected{state}
-	UsageTokensIn          *Counter   // usage.tokens_in{model}
-	UsageTokensOut         *Counter   // usage.tokens_out{model}
-	UsageDropped           *Counter   // usage.dropped{reason}
-	RateLimited            *Counter   // ratelimit.rejected{scope}
-	RateLimitFailOpen      *Counter   // ratelimit.fail_open
-	QuotaGateFails         *Counter   // quota.gate_fails (usage-store failure, failed open)
-	QuotaRejected          *Counter   // quota.rejected (WINDOW_QUOTA_EXCEEDED)
-	IdempotencyHits        *Counter   // idempotency.hits{outcome}
-	MeterQueueDepth        *Gauge     // meter.queue_depth
-	MeterBatchLatencyMS    *Histogram // meter.batch_latency_ms
-	RedisOps               *Counter   // redis.commands{op,status}
-	PoolSaturation         *Gauge     // pg.pool_saturation_pct
-	PaymentOrders          *Counter   // payment.orders{provider,event,status}
-	PaymentPlanActivations *Counter   // payment.plan_days_activated{provider,plan}
-	PaymentWebhooks        *Counter   // payment.webhooks{outcome,event}
+	HTTPRequests            *Counter   // http.requests{route,status,method}
+	HTTPDurationMS          *Histogram // http.duration_ms{route}
+	ActiveRequests          *Gauge     // http.active_requests
+	ActiveStreams           *Gauge     // stream.active
+	EventsForwarded         *Counter   // stream.events_forwarded{type}
+	CallsCompleted          *Counter   // llm.calls_completed{status}
+	UpstreamRequests        *Counter   // upstream.requests{status}
+	UpstreamDurationMS      *Histogram // upstream.duration_ms
+	UpstreamStreamEvents    *Counter   // upstream.stream_chunks
+	UpstreamBreakerState    *Gauge     // upstream.breaker_state (0 closed, 1 half-open, 2 open)
+	UpstreamBreakerTrips    *Counter   // upstream.breaker_trips{reason}
+	UpstreamBreakerRejected *Counter   // upstream.breaker_rejected{state}
+	UsageTokensIn           *Counter   // usage.tokens_in{model}
+	UsageTokensOut          *Counter   // usage.tokens_out{model}
+	UsageDropped            *Counter   // usage.dropped{reason}
+	UsageSpilled            *Counter   // usage.spilled (records written to the durable outbox)
+	UsageReplayed           *Counter   // usage.replayed (records recovered from the outbox)
+	RateLimited             *Counter   // ratelimit.rejected{scope}
+	RateLimitFailOpen       *Counter   // ratelimit.fail_open
+	QuotaGateFails          *Counter   // quota.gate_fails (usage-store failure, failed open)
+	QuotaRejected           *Counter   // quota.rejected (WINDOW_QUOTA_EXCEEDED)
+	IdempotencyHits         *Counter   // idempotency.hits{outcome}
+	MeterQueueDepth         *Gauge     // meter.queue_depth
+	MeterBatchLatencyMS     *Histogram // meter.batch_latency_ms
+	RedisOps                *Counter   // redis.commands{op,status}
+	PoolSaturation          *Gauge     // pg.pool_saturation_pct
+	PaymentOrders           *Counter   // payment.orders{provider,event,status}
+	PaymentPlanActivations  *Counter   // payment.plan_days_activated{provider,plan}
+	PaymentWebhooks         *Counter   // payment.webhooks{outcome,event}
+}
+
+// authRevocationFailOpen is the auth-path revocation fail-open counter
+// (audit M2). The auth package deliberately does not depend on the Metrics
+// registry; this lazy package-level instrument keeps the seam nil-safe.
+var authRevocationFailOpen *Counter
+
+// AuthRevocationFailOpen returns the revocation fail-open counter (nil-safe:
+// no-op when telemetry is not configured).
+func AuthRevocationFailOpen() *Counter {
+	if authRevocationFailOpen != nil {
+		return authRevocationFailOpen
+	}
+	return NewCounter("mash_auth_revocation_failopen_total",
+		"Revocation checks that failed open (Redis unavailable; revoked tokens honoured until expiry)")
 }
 
 // NewMetrics builds all instruments from the global provider.
 func NewMetrics() *Metrics {
 	latencyBuckets := []float64{1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000}
 	return &Metrics{
-		HTTPRequests:           NewCounter("mash_http_requests_total", "HTTP requests by route/status/method"),
-		HTTPDurationMS:         NewHistogram("mash_http_duration_ms", "HTTP request duration in ms", latencyBuckets...),
-		ActiveRequests:         NewGauge("mash_http_active_requests", "In-flight HTTP requests"),
-		ActiveStreams:          NewGauge("mash_stream_active", "Active LLM event streams"),
-		EventsForwarded:        NewCounter("mash_stream_events_forwarded_total", "Events delivered to clients by type"),
-		CallsCompleted:         NewCounter("mash_llm_calls_total", "LLM calls completed by status"),
-		BifrostRequests:        NewCounter("mash_bifrost_requests_total", "Bifrost upstream requests by status"),
-		BifrostDurationMS:      NewHistogram("mash_bifrost_duration_ms", "Bifrost upstream call duration in ms", latencyBuckets...),
-		BifrostStreamEvents:    NewCounter("mash_bifrost_stream_chunks_total", "Bifrost SSE chunks consumed"),
-		BifrostBreakerState:    NewGauge("mash_bifrost_breaker_state", "Bifrost circuit breaker state (0 closed, 1 half-open, 2 open)"),
-		BifrostBreakerTrips:    NewCounter("mash_bifrost_breaker_trips_total", "Bifrost circuit breaker trips by reason"),
-		BifrostBreakerRejected: NewCounter("mash_bifrost_breaker_rejected_total", "Bifrost calls fast-failed by the open circuit breaker"),
-		UsageTokensIn:          NewCounter("mash_usage_input_tokens_total", "Authoritative input tokens metered"),
-		UsageTokensOut:         NewCounter("mash_usage_output_tokens_total", "Authoritative output tokens metered"),
-		UsageDropped:           NewCounter("mash_usage_dropped_total", "Usage records dropped by reason"),
-		RateLimited:            NewCounter("mash_ratelimit_rejected_total", "Requests rejected by rate limiter"),
-		RateLimitFailOpen:      NewCounter("mash_ratelimit_failopen_total", "Rate limiter fail-open events (Redis unavailable)"),
-		QuotaGateFails:         NewCounter("mash_quota_gate_fails_total", "Window-quota gate usage-store failures (failed open)"),
-		QuotaRejected:          NewCounter("mash_quota_rejected_total", "LLM calls rejected: rolling token window quota exceeded"),
-		MeterQueueDepth:        NewGauge("mash_meter_queue_depth", "Usage recorder queue depth"),
-		MeterBatchLatencyMS:    NewHistogram("mash_meter_batch_latency_ms", "Usage batch flush duration ms", latencyBuckets...),
+		HTTPRequests:            NewCounter("mash_http_requests_total", "HTTP requests by route/status/method"),
+		HTTPDurationMS:          NewHistogram("mash_http_duration_ms", "HTTP request duration in ms", latencyBuckets...),
+		ActiveRequests:          NewGauge("mash_http_active_requests", "In-flight HTTP requests"),
+		ActiveStreams:           NewGauge("mash_stream_active", "Active LLM event streams"),
+		EventsForwarded:         NewCounter("mash_stream_events_forwarded_total", "Events delivered to clients by type"),
+		CallsCompleted:          NewCounter("mash_llm_calls_total", "LLM calls completed by status"),
+		UpstreamRequests:        NewCounter("mash_upstream_requests_total", "OpenRouter upstream requests by status"),
+		UpstreamDurationMS:      NewHistogram("mash_upstream_duration_ms", "OpenRouter upstream call duration in ms", latencyBuckets...),
+		UpstreamStreamEvents:    NewCounter("mash_upstream_stream_chunks_total", "OpenRouter SSE chunks consumed"),
+		UpstreamBreakerState:    NewGauge("mash_upstream_breaker_state", "Upstream circuit breaker state (0 closed, 1 half-open, 2 open)"),
+		UpstreamBreakerTrips:    NewCounter("mash_upstream_breaker_trips_total", "Upstream circuit breaker trips by reason"),
+		UpstreamBreakerRejected: NewCounter("mash_upstream_breaker_rejected_total", "Upstream calls fast-failed by the open circuit breaker"),
+		UsageTokensIn:           NewCounter("mash_usage_input_tokens_total", "Authoritative input tokens metered"),
+		UsageTokensOut:          NewCounter("mash_usage_output_tokens_total", "Authoritative output tokens metered"),
+		UsageDropped:            NewCounter("mash_usage_dropped_total", "Usage records dropped by reason"),
+		UsageSpilled:            NewCounter("mash_usage_spilled_total", "Usage records written to the durable outbox after write failures"),
+		UsageReplayed:           NewCounter("mash_usage_replayed_total", "Usage records recovered from the durable outbox"),
+		RateLimited:             NewCounter("mash_ratelimit_rejected_total", "Requests rejected by rate limiter"),
+		RateLimitFailOpen:       NewCounter("mash_ratelimit_failopen_total", "Rate limiter fail-open events (Redis unavailable)"),
+		QuotaGateFails:          NewCounter("mash_quota_gate_fails_total", "Window-quota gate usage-store failures (failed open)"),
+		QuotaRejected:           NewCounter("mash_quota_rejected_total", "LLM calls rejected: rolling token window quota exceeded"),
+		MeterQueueDepth:         NewGauge("mash_meter_queue_depth", "Usage recorder queue depth"),
+		MeterBatchLatencyMS:     NewHistogram("mash_meter_batch_latency_ms", "Usage batch flush duration ms", latencyBuckets...),
 
 		RedisOps:               NewCounter("mash_redis_commands_total", "Redis commands by op/status"),
 		PoolSaturation:         NewGauge("mash_pg_pool_saturation_pct", "PostgreSQL pool saturation percentage"),

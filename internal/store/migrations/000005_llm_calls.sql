@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     user_id        TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     request_id     TEXT NOT NULL,                       -- correlation id (x-request-id)
     requested_model TEXT NOT NULL,                      -- client-requested "provider/model"
-    resolved_model TEXT,                                -- model actually served (Bifrost)
+    resolved_model TEXT,                                -- model actually served (OpenRouter)
     provider       TEXT,                                -- upstream provider
     stream         BOOLEAN NOT NULL DEFAULT TRUE,
     status         TEXT NOT NULL

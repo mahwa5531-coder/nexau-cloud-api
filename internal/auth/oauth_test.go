@@ -43,6 +43,20 @@ type fakeGoogle struct {
 	codes      map[string]bool // issued codes
 	exchanges  int
 	idClaimsFn func() jwt.MapClaims // override per-test
+	lastVer    string               // code_verifier received at /token (PKCE wire check)
+}
+
+// rotate swaps the signing key and kid — JWKS key rotation (audit L14).
+func (fg *fakeGoogle) rotate(t *testing.T) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa keygen: %v", err)
+	}
+	fg.mu.Lock()
+	fg.key = key
+	fg.kid = "test-key-rotated"
+	fg.mu.Unlock()
 }
 
 func newFakeGoogle(t *testing.T) *fakeGoogle {
@@ -82,6 +96,7 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 		_, known := fg.codes[code]
 		fg.codes[code] = true
 		fg.exchanges++
+		fg.lastVer = r.Form.Get("code_verifier")
 		fg.mu.Unlock()
 		if !known {
 			w.WriteHeader(400)
@@ -273,12 +288,16 @@ func (env *oauthTestEnv) runOAuth(t *testing.T, sub, email string) (*domain.User
 		t.Fatalf("redirect to unexpected place: %s", redirect)
 	}
 
+	// The real Google echoes the authorization request's nonce into the ID
+	// token (OIDC); the fake mirrors that behaviour (audit M1).
+	nonce := extractQueryParam(t, redirect, "nonce")
 	env.fg.mu.Lock()
 	env.fg.idClaimsFn = func() jwt.MapClaims {
 		return jwt.MapClaims{
 			"iss": "https://accounts.google.com", "aud": "test-client-id",
 			"sub": sub, "email": email, "email_verified": true,
 			"name": "O Auth", "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+			"nonce": nonce,
 		}
 	}
 	env.fg.mu.Unlock()
@@ -303,10 +322,12 @@ func extractQueryParam(t *testing.T, rawURL, key string) string {
 
 func TestGoogleAuthCodeURL(t *testing.T) {
 	g := NewGoogleProvider("cid", "csecret", "https://api.x.test/cb", "https://auth.example/auth", "https://tok.example/token", "https://jwks.example/certs", nil)
-	url := g.AuthCodeURL("thestate")
+	url := g.AuthCodeURL("thestate", S256CodeChallenge("theverifier"), "thenonce")
 	for _, want := range []string{
 		"client_id=cid", "redirect_uri=", "response_type=code",
 		"scope=openid+email+profile", "state=thestate", "prompt=select_account",
+		// PKCE + nonce (audit M1): the code alone is not a credential.
+		"code_challenge=", "code_challenge_method=S256", "nonce=thenonce",
 	} {
 		if !strings.Contains(url, want) {
 			t.Fatalf("auth url missing %q: %s", want, url)
@@ -318,7 +339,7 @@ func TestGoogleExchangeHappyPath(t *testing.T) {
 	env := newOAuthTestEnv(t)
 	ctx := context.Background()
 
-	ident, err := env.svc.Google.Exchange(ctx, env.fg.code())
+	ident, err := env.svc.Google.Exchange(ctx, env.fg.code(), "", "")
 	if err != nil {
 		t.Fatalf("exchange: %v", err)
 	}
@@ -331,7 +352,7 @@ func TestGoogleExchangeRejectsForgedSignature(t *testing.T) {
 	env := newOAuthTestEnv(t)
 	// A token signed by a key NOT in the served JWKS must be rejected.
 	forged := env.fg.forgeToken(t, nil)
-	if _, err := env.svc.Google.verifyIDToken(context.Background(), forged); err == nil {
+	if _, err := env.svc.Google.verifyIDToken(context.Background(), forged, ""); err == nil {
 		t.Fatal("forged signature accepted")
 	} else if de := domain.AsError(err); de.Code != "OAUTH_PROVIDER_ERROR" {
 		t.Fatalf("expected OAUTH_PROVIDER_ERROR, got %s", de.Code)
@@ -361,7 +382,7 @@ func TestGoogleExchangeRejectsBadAudienceIssuerExpiry(t *testing.T) {
 			if err != nil {
 				t.Fatalf("sign: %v", err)
 			}
-			if _, err := env.svc.Google.verifyIDToken(context.Background(), signed); err == nil {
+			if _, err := env.svc.Google.verifyIDToken(context.Background(), signed, ""); err == nil {
 				t.Fatalf("%s: accepted", tc.name)
 			}
 			_ = tok
@@ -382,11 +403,13 @@ func TestOAuthStateLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
+	nonce := extractQueryParam(t, redirect, "nonce")
 	env.fg.mu.Lock()
 	env.fg.idClaimsFn = func() jwt.MapClaims {
 		return jwt.MapClaims{"iss": "https://accounts.google.com", "aud": "test-client-id",
 			"sub": "sub-a", "email": "a@example.test", "email_verified": true,
-			"name": "A User", "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}
+			"name": "A User", "iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+			"nonce": nonce}
 	}
 	env.fg.mu.Unlock()
 	code1 := env.fg.code()
@@ -445,11 +468,13 @@ func TestOAuthStateLifecycle(t *testing.T) {
 
 func TestOAuthUnverifiedProviderEmailRejected(t *testing.T) {
 	env := newOAuthTestEnv(t)
+	var nonce string
 	env.fg.mu.Lock()
 	env.fg.idClaimsFn = func() jwt.MapClaims {
 		return jwt.MapClaims{"iss": "https://accounts.google.com", "aud": "test-client-id",
 			"sub": "sub-b", "email": "b@example.test", "email_verified": false,
-			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}
+			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+			"nonce": nonce}
 	}
 	env.fg.mu.Unlock()
 
@@ -457,6 +482,7 @@ func TestOAuthUnverifiedProviderEmailRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
+	nonce = extractQueryParam(t, redirect, "nonce")
 	if _, _, err := env.svc.FinishGoogleOAuth(context.Background(), env.fg.code(), extractQueryParam(t, redirect, "state"), tx); err == nil {
 		t.Fatal("unverified email accepted")
 	} else if de := domain.AsError(err); de.Code != "OAUTH_EMAIL_UNVERIFIED" {

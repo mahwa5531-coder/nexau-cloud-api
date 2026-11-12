@@ -57,13 +57,22 @@ func (a *API) meView(r *http.Request, idn *auth.Identity) map[string]any {
 
 	// Quota position: authoritative rolling-window normalized-token usage
 	// (the exact sums the enforcement gate reads), percent and — when a
-	// window is at or over quota — the exact recovery instant. Computed
-	// here — NOT in the per-request identity resolver — so the hot path
-	// stays quota-query-free; /v1/me is called at app start and after
-	// calls, not per request.
+	// window is at or over quota — the exact recovery instant. Read
+	// through the proxy's short-TTL Redis cache (audit M7): /v1/me is
+	// polled by desktops and must not re-run the llm_calls SUM per call,
+	// and reusing the gate's own cache means the usage bar can never
+	// diverge from enforcement. Computed here — NOT in the per-request
+	// identity resolver — so the hot path stays quota-query-free.
 	if (idn.Limits.Window5hTokens > 0 || idn.Limits.WindowWeeklyTokens > 0) && a.usage != nil {
-		pos, err := a.usage.WindowUsage(r.Context(), idn.Tenant.ID)
-		if err == nil {
+		var pos *domain.WindowUsage
+		var err error
+		if a.proxy != nil {
+			pos, err = a.proxy.QuotaPosition(r.Context(), idn.Tenant.ID,
+				idn.Limits.Window5hTokens, idn.Limits.WindowWeeklyTokens)
+		} else {
+			pos, err = a.usage.WindowUsage(r.Context(), idn.Tenant.ID)
+		}
+		if err == nil && pos != nil {
 			var windows []map[string]any
 			if q := idn.Limits.Window5hTokens; q > 0 {
 				windows = append(windows, a.windowView(r, idn, "5h", q, pos.Used5h, 5*time.Hour))

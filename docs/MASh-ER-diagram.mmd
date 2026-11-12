@@ -92,7 +92,7 @@ erDiagram
         bigint reasoning_tokens
         bigint cache_read_tokens
         bigint cache_write_tokens
-        numeric total_cost "Bifrost-reported"
+        numeric total_cost "OpenRouter-reported"
         int latency_ms
         timestamptz recorded_at "rolling-window math column (5h / 7d SUMs)"
     }

@@ -245,10 +245,13 @@ func CORS(allowed []string) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
 			if origin != "" {
+				// Vary: Origin ALWAYS when an origin is present (audit L20):
+				// setting it only for ALLOWED origins let shared caches serve a
+				// cross-origin variant to requests it was never negotiated for.
+				w.Header().Add("Vary", "Origin")
 				if _, ok := set[strings.ToLower(origin)]; ok {
 					h := w.Header()
 					h.Set("Access-Control-Allow-Origin", origin)
-					h.Set("Vary", "Origin")
 					h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 					h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Request-Id")
 					h.Set("Access-Control-Expose-Headers", "X-Request-Id")

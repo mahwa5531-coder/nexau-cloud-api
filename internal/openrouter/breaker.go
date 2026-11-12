@@ -1,11 +1,11 @@
-package bifrost
+package openrouter
 
-// breaker.go — upstream circuit breaker for the Bifrost gateway path.
+// breaker.go — upstream circuit breaker for the OpenRouter path.
 //
 // Failure model (what the breaker protects against):
 // the GATEWAY dying or stalling — connection failures, dial timeouts,
 // 5xx/408 statuses, mid-stream termination. Provider-level quality issues
-// (4xx validation, 429 throttling, in-band BifrostError payloads riding a
+// (4xx validation, 429 throttling, in-band error payloads riding a
 // healthy 200 SSE stream) prove the gateway is alive and are recorded as
 // successes; the breaker must not trip on them.
 //
@@ -35,9 +35,9 @@ package bifrost
 // per-process (per replica): each replica opens and recovers independently,
 // which is the standard deployment shape for in-process breakers.
 //
-// Observability: mash_bifrost_breaker_state gauge (0 closed, 1 half-open,
-// 2 open), mash_bifrost_breaker_trips_total{reason} and
-// mash_bifrost_breaker_rejected_total{state} counters. The state is also
+// Observability: mash_upstream_breaker_state gauge (0 closed, 1 half-open,
+// 2 open), mash_upstream_breaker_trips_total{reason} and
+// mash_upstream_breaker_rejected_total{state} counters. The state is also
 // surfaced through GET /health/ready (informational, never readiness-gating).
 
 import (
@@ -292,7 +292,7 @@ func (cb *circuitBreaker) tripLocked(reason string) {
 	cb.probes = 0
 	cb.clearRingLocked()
 	if cb.metrics != nil {
-		cb.metrics.BifrostBreakerTrips.Add(context.Background(), 1,
+		cb.metrics.UpstreamBreakerTrips.Add(context.Background(), 1,
 			observability.Attr("reason", reason))
 	}
 	cb.observeStateLocked()
@@ -349,7 +349,7 @@ func (cb *circuitBreaker) observeStateLocked() {
 	if cb.metrics == nil {
 		return
 	}
-	cb.metrics.BifrostBreakerState.Set(int64(cb.state))
+	cb.metrics.UpstreamBreakerState.Set(int64(cb.state))
 }
 
 // noteRejected counts one fast-fail rejection.
@@ -357,7 +357,7 @@ func (cb *circuitBreaker) noteRejected() {
 	if cb == nil || cb.metrics == nil {
 		return
 	}
-	cb.metrics.BifrostBreakerRejected.Add(context.Background(), 1,
+	cb.metrics.UpstreamBreakerRejected.Add(context.Background(), 1,
 		observability.Attr("state", cb.stateName()))
 }
 

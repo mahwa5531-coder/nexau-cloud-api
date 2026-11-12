@@ -321,6 +321,30 @@ func (r *PaymentsRepo) ApplyExpired(ctx context.Context, orderID string) (bool, 
 }
 
 // ExpireStale bulk-expires open orders past their TTL.
+// ListRecentlyExpired returns expired orders whose expiry falls inside the
+// trailing window (audit H5). UPI and wallet settlements can land AFTER our
+// order TTL flipped the row to expired; those captures are real money and
+// must still converge to paid (paid beats expired — ApplyPaid's state guard
+// is status <> 'paid', so an expired row still transitions).
+func (r *PaymentsRepo) ListRecentlyExpired(ctx context.Context, within time.Duration, limit int) ([]*payment.Order, error) {
+	rows, err := r.Pool.Query(ctx,
+		`SELECT `+orderCols+` FROM payment_orders
+		 WHERE status = 'expired' AND expires_at > now() - $1::interval
+		 ORDER BY expires_at ASC LIMIT $2`, within.String(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*payment.Order
+	for rows.Next() {
+		o, err := scanOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
 func (r *PaymentsRepo) ExpireStale(ctx context.Context, now time.Time) (int64, error) {
 	tag, err := r.Pool.Exec(ctx, `
                 UPDATE payment_orders
@@ -392,4 +416,21 @@ func (r *PaymentsRepo) Subscription(ctx context.Context, tenantID string) (*paym
 		}
 	}
 	return st, nil
+}
+
+// PurgeOldWebhookEvents deletes recorded webhook payloads older than the
+// cutoff, in one bounded batch (audit H9: after the retention window every
+// referenced order is terminal; the payload's recovery value is gone).
+func (r *PaymentsRepo) PurgeOldWebhookEvents(ctx context.Context, before time.Time, batch int) (int64, error) {
+	if batch <= 0 {
+		batch = 5000
+	}
+	tag, err := r.Pool.Exec(ctx, `
+		DELETE FROM payment_webhook_events
+		 WHERE ctid IN (SELECT ctid FROM payment_webhook_events WHERE received_at < $1 LIMIT $2)`,
+		before, batch)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

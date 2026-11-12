@@ -119,12 +119,21 @@ func (r *OAuthUsersRepo) FindOrCreateGoogleUser(ctx context.Context, sub, email,
 		VALUES ($1, $2, 'owner', 'active')`, tenantID, userID); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `
+	ct, err := tx.Exec(ctx, `
 		INSERT INTO subscriptions (id, tenant_id, plan_id, status, current_period_start, current_period_end)
 		SELECT $1, $2, id, 'active', now(), NULL
 		FROM plans WHERE id = 'pln_free'`,
-		"sub_"+shortRand(20), tenantID); err != nil {
+		"sub_"+shortRand(20), tenantID)
+	if err != nil {
 		return nil, err
+	}
+	// INSERT..SELECT inserts NOTHING when the seed plan row is absent —
+	// silently, successfully (audit M15): the tenant then exists with no
+	// subscription and fails downstream in ways nobody can trace back to
+	// provisioning. Zero rows is a broken deployment: fail the whole
+	// provisioning transaction loudly instead.
+	if ct.RowsAffected() == 0 {
+		return nil, errors.New("oauth provisioning: seed plan 'pln_free' missing — database not seeded")
 	}
 	if _, err := tx.Exec(ctx, `UPDATE users SET last_login_at = now() WHERE id = $1`, userID); err != nil {
 		return nil, err

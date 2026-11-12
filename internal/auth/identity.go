@@ -120,13 +120,24 @@ func (r *IdentityResolver) load(ctx context.Context, userID, tenantID string) (*
 		planInfo = PlanInfo{ID: sub.Plan.ID, Code: sub.Plan.Code, Name: sub.Plan.Name}
 		planLimits = sub.Plan.Limits
 		planModels = sub.Plan.Models
-	} else if fp, ferr := r.Subs.PlanByCode(ctx, "free"); ferr == nil && fp != nil {
-		id.SubscriptionStatus = "active" // ponytail: perpetual free fallback is active, matching /v1/me and auditlive specs
+	} else {
+		fp, ferr := r.Subs.PlanByCode(ctx, "free")
+		if ferr != nil {
+			return nil, store.MapDBError(ferr)
+		}
+		if fp == nil {
+			// The free plan is the bedrock every tenant falls back
+			// to. A deployment without it must fail CLOSED — the
+			// old silent fall-through left every limit at its zero
+			// value, and zero means UNLIMITED here: one missing
+			// seed row silently turned the whole API into an
+			// all-you-can-eat plan.
+			return nil, store.MapDBError(errors.New("plan 'free' is missing: database not seeded"))
+		}
+		id.SubscriptionStatus = "active" // perpetual free fallback is active, matching /v1/me and auditlive specs
 		planInfo = PlanInfo{ID: fp.ID, Code: fp.Code, Name: fp.Name}
 		planLimits = fp.Limits
 		planModels = fp.Models
-	} else if ferr != nil {
-		return nil, store.MapDBError(ferr)
 	}
 	if planInfo.Code != "" {
 		id.Plan = planInfo
@@ -152,12 +163,4 @@ func (r *IdentityResolver) load(ctx context.Context, userID, tenantID string) (*
 
 func identityCacheKey(userID, tenantID string) string {
 	return fmt.Sprintf("%s%s:%s", identityCachePrefix, userID, tenantID)
-}
-
-// Invalidate drops the cached identity (called on logout / admin changes).
-func (r *IdentityResolver) Invalidate(ctx context.Context, userID, tenantID string) {
-	if r.Redis == nil {
-		return
-	}
-	r.Redis.Del(ctx, identityCacheKey(userID, tenantID))
 }

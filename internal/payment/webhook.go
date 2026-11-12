@@ -3,11 +3,13 @@ package payment
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mash-cloud/mash-api/internal/observability"
 	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/mash-cloud/mash-api/internal/ids"
 )
 
 // HandleWebhook processes a provider webhook end-to-end:
@@ -31,7 +33,7 @@ func (s *Service) HandleWebhook(ctx context.Context, raw []byte, signature, clie
 	// Budget first (cheap): a webhook flood must not reach HMAC+DB.
 	if s.lim != nil && s.cfg.WebhookPerIP > 0 {
 		if !s.lim.Admit(ctx, webhookBudgetKey(clientIP), time.Minute, s.cfg.WebhookPerIP,
-			fmt.Sprintf("wh-%d", time.Now().UnixNano())) {
+			ids.New("wh")) {
 			return errWebhookBudget
 		}
 	}
@@ -75,6 +77,24 @@ func (s *Service) HandleWebhook(ctx context.Context, raw []byte, signature, clie
 	}
 	if duplicate {
 		s.webhookMetric("duplicate", observability.Attr("event", ev.Type))
+		// Audit H4 — converge, do not merely acknowledge. The first delivery
+		// may have recorded this event and died BEFORE applying it (rolling
+		// deploy, OOM — a millisecond window). The provider's retry used to be
+		// swallowed right here by our own dedupe, permanently losing a captured
+		// payment the system was told about TWICE. For paid-class events whose
+		// order is still not paid, apply now: applyPaid is a state-machine
+		// conditional UPDATE (paid is absorbing), so this can never double-apply
+		// — it only closes the recorded-but-unapplied gap.
+		if o != nil && (ev.Type == EventPaymentCaptured || ev.Type == EventOrderPaid) && o.Status != StatusPaid {
+			if ev.AmountPaise > 0 && ev.AmountPaise != o.AmountPaise {
+				s.webhookMetric("amount_mismatch", observability.Attr("event", ev.Type))
+				return ErrAmountMismatch(o.AmountPaise, ev.AmountPaise)
+			}
+			if _, err := s.applyPaid(ctx, o.ID, ev.ProviderPaymentID); err != nil {
+				return err // 5xx → provider retries again → correct
+			}
+			s.webhookMetric("converged_duplicate", observability.Attr("event", ev.Type))
+		}
 		return nil
 	}
 
@@ -82,6 +102,15 @@ func (s *Service) HandleWebhook(ctx context.Context, raw []byte, signature, clie
 		// Recorded for audit, acted on never (refund reversal is v2 — the
 		// ledger kind enum already reserves it).
 		s.webhookMetric("ignored", observability.Attr("event", ev.Type))
+		// Audit L16: every refund is currently a free plan extension until
+		// someone manually reconciles. Make that VISIBLE: a dedicated outcome +
+		// a loud warn (rate-friendly: one line per event) so the daily
+		// refunds-vs-active-entitlements review has a hook to start from.
+		if strings.Contains(ev.Type, "refund") || strings.Contains(ev.Type, "charge.disputed") {
+			s.webhookMetric("refund_recorded", observability.Attr("event", ev.Type))
+			observability.LogWarn("payment: refund/dispute recorded — entitlement NOT reversed (v2); manual reconciliation required",
+				"event_id", ev.EventID, "event_type", ev.Type, "order_id", ev.LocalOrderID)
+		}
 		return nil
 	}
 

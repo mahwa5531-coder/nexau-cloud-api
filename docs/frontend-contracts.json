@@ -1,0 +1,537 @@
+{
+  "service": "MASh Cloud API",
+  "api_version": "v1",
+  "updated": "2026-11-07",
+  "source_of_truth": "docs/FRONTEND-CONTRACTS.md (fields extracted from internal/api handlers)",
+  "conventions": {
+    "content_type": "application/json",
+    "auth_header": "Authorization: Bearer <access_token>",
+    "request_id": "Every response carries X-Request-Id; inbound id must match [A-Za-z0-9._-] and be <=128 chars",
+    "timestamps": "RFC3339 UTC",
+    "money": "integer paise (INR): 199900 = Rs 1,999.00",
+    "token_counts": "normalized tokens (model-weighted; same numbers the quota gate enforces)",
+    "body_policy": "exactly one JSON document per request; trailing bytes => 400 INVALID_REQUEST",
+    "error_envelope": {
+      "shape": { "error": { "code": "string", "message": "string", "request_id": "string", "details": "object (optional)" } },
+      "example": {
+        "error": {
+          "code": "WINDOW_QUOTA_EXCEEDED",
+          "message": "The token quota for this plan window has been reached.",
+          "request_id": "req_01JD2Z9K3M",
+          "details": { "window": "5h", "quota_tokens": 60000, "used_tokens": 61250, "resets_at": "2026-11-07T12:41:03Z" }
+        }
+      }
+    },
+    "http_details": {
+      "405": "carries Allow header",
+      "429": "carries Retry-After (seconds) and details.retry_after_ms"
+    }
+  },
+  "session_classes": [
+    { "class": "device", "obtained_via": ["POST /v1/auth/desktop/exchange", "POST /v1/auth/refresh"], "scope": "api", "access_ttl": "15m", "refresh_ttl": "30d rotating" },
+    { "class": "web", "obtained_via": ["POST /v1/auth/web/session"], "scope": "web", "access_ttl": "15m", "refresh_ttl": null, "note": "device-only routes answer 403 FORBIDDEN to web tokens" }
+  ],
+  "token_clocks": {
+    "access_token": "15m",
+    "refresh_token": "30d (rotating)",
+    "web_session_token": "15m (no refresh)",
+    "oauth_state": "10m",
+    "web_grant": "5m single-use",
+    "desktop_code": "60s single-use",
+    "payment_order": "15m (late capture honored 24h)"
+  },
+  "endpoints": [
+    {
+      "id": "health-live", "method": "GET", "path": "/health/live", "auth": "none",
+      "summary": "Process is up (never touches dependencies)",
+      "request": null,
+      "response_status": 200,
+      "response": { "status": "ok", "time": "2026-11-07T09:00:00Z" },
+      "errors": []
+    },
+    {
+      "id": "health-ready", "method": "GET", "path": "/health/ready", "auth": "none",
+      "summary": "Dependencies (postgres/redis/openrouter) answer within budget",
+      "request": null,
+      "response_status": 200,
+      "response": {
+        "status": "ok",
+        "dependencies": [
+          { "name": "postgres", "ok": true, "latency_ms": 2 },
+          { "name": "redis", "ok": true, "latency_ms": 1 },
+          { "name": "openrouter", "ok": true, "latency_ms": 143 }
+        ],
+        "upstream_circuit": "closed",
+        "time": "2026-11-07T09:00:00Z"
+      },
+      "errors": [
+        { "status": 503, "code": "unavailable status", "when": "any hard dependency failed; body status field = \"unavailable\"" }
+      ]
+    },
+    {
+      "id": "auth-refresh", "method": "POST", "path": "/v1/auth/refresh", "auth": "none (per-IP throttled)",
+      "summary": "Rotate the desktop token pair; old refresh token dies, persist the new pair",
+      "request": { "refresh_token": "rt_9f2c…" },
+      "response_status": 200,
+      "response": {
+        "access_token": "eyJhbGciOi…",
+        "token_type": "Bearer",
+        "expires_in": 900,
+        "refresh_token": "rt_51ab…",
+        "user": { "id": "usr_2y8M", "email": "asha@example.com", "display_name": "Asha", "avatar_url": "https://lh3.googleusercontent.com/…", "status": "active", "is_platform_admin": false, "email_verified": true },
+        "tenant": { "id": "tn_7Qk1", "slug": "asha-firm", "name": "Asha & Co", "status": "active" }
+      },
+      "response_fields": {
+        "expires_in": "seconds (int)",
+        "user": "UserInfo {id, email, display_name, avatar_url?, status, is_platform_admin, email_verified}",
+        "tenant": "TenantInfo {id, slug, name, status}"
+      },
+      "errors": [
+        { "status": 400, "code": "INVALID_REQUEST", "when": "missing/oversized refresh_token, malformed JSON" },
+        { "status": 401, "code": "REFRESH_TOKEN_EXPIRED", "when": "token past 30d — sign in again (no family purge)" },
+        { "status": 401, "code": "REFRESH_TOKEN_REUSED", "when": "replayed consumed/revoked token — ALL sessions revoked; sign in again" },
+        { "status": 401, "code": "ACCOUNT_INACTIVE", "when": "account deactivated" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "per-IP budget (scope refresh_ip, Retry-After 60)" }
+      ]
+    },
+    {
+      "id": "auth-logout", "method": "POST", "path": "/v1/auth/logout", "auth": "session",
+      "summary": "Sign out this device: revoke one refresh token (body optional) + blacklist presented access jti",
+      "request": { "refresh_token": "rt_51ab…" },
+      "response_status": 200,
+      "response": { "logged_out": true },
+      "errors": []
+    },
+    {
+      "id": "auth-logout-all", "method": "POST", "path": "/v1/auth/logout-all", "auth": "session",
+      "summary": "Sign out everywhere: revoke every refresh-token family (lost device response)",
+      "request": null,
+      "response_status": 200,
+      "response": { "logged_out": true, "sessions_killed": 3 },
+      "errors": []
+    },
+    {
+      "id": "oauth-begin", "method": "GET", "path": "/v1/auth/oauth/google", "auth": "browser top-level navigation",
+      "summary": "Begin Continue-with-Google; sets mash_oauth_tx HttpOnly cookie, 302 to Google consent",
+      "request": null,
+      "response_status": 302,
+      "response": "redirect to Google consent screen (not JSON)",
+      "errors": [
+        { "status": 503, "code": "OAUTH_DISABLED", "when": "OAuth not configured on deployment" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "per-IP budget (scope oauth_ip)" }
+      ]
+    },
+    {
+      "id": "oauth-callback", "method": "GET", "path": "/v1/auth/oauth/google/callback", "auth": "browser (tx cookie)",
+      "summary": "Finish OAuth: 302 to web success page ?grant=<single-use code>; failures 302 to login page ?error=<code>; tokens never appear in URLs",
+      "request": "query: code, state (set by Google)",
+      "response_status": 302,
+      "response": "redirect with ?grant=… (success) or ?error=<code> (failure)",
+      "errors_in_redirect": ["OAUTH_STATE_INVALID", "OAUTH_EMAIL_UNVERIFIED", "OAUTH_PROVIDER_ERROR", "IDENTITY_CONFLICT"]
+    },
+    {
+      "id": "web-session", "method": "POST", "path": "/v1/auth/web/session", "auth": "none (grant in body, per-IP throttled)",
+      "summary": "Exchange the single-use OAuth grant for a 15-minute web session token (NO refresh token; page memory only)",
+      "request": { "grant": "<code from the success redirect>" },
+      "response_status": 200,
+      "response": {
+        "access_token": "eyJhbGciOi…",
+        "token_type": "Bearer",
+        "expires_in": 900,
+        "user": { "id": "usr_2y8M", "email": "asha@example.com", "display_name": "Asha", "status": "active", "is_platform_admin": false },
+        "tenant": { "id": "tn_7Qk1", "slug": "asha-firm", "name": "Asha & Co", "status": "active" }
+      },
+      "errors": [
+        { "status": 400, "code": "INVALID_OR_EXPIRED_CODE", "when": "bad/replayed/expired grant" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "per-IP budget (scope web_session_ip)" }
+      ]
+    },
+    {
+      "id": "desktop-code", "method": "POST", "path": "/v1/auth/desktop/code", "auth": "session (web or device)",
+      "summary": "Mint the 60-second single-use pairing code the web page passes to the desktop (deep link / loopback)",
+      "request": null,
+      "response_status": 200,
+      "response": { "code": "mcode_8Kd0…", "expires_in": 60 },
+      "errors": [
+        { "status": 429, "code": "RATE_LIMITED", "when": "per-user budget (scope desktop_code_user)" }
+      ]
+    },
+    {
+      "id": "desktop-exchange", "method": "POST", "path": "/v1/auth/desktop/exchange", "auth": "none (mcode in body, per-IP throttled)",
+      "summary": "THE DESKTOP LOGIN: mcode -> full TokenPair (15m access + 30d rotating refresh). Single-use; losing channel gets INVALID_OR_EXPIRED_CODE",
+      "request": { "code": "mcode_8Kd0…", "device_name": "Asha's MacBook", "platform": "macos", "device_id": "dev_3f9a2b" },
+      "request_field_limits": { "code": 128, "device_name": 128, "platform": 32, "device_id": 64 },
+      "response_status": 200,
+      "response": "TokenPair — same shape as POST /v1/auth/refresh response",
+      "errors": [
+        { "status": 400, "code": "INVALID_OR_EXPIRED_CODE", "when": "bad/replayed/expired mcode" },
+        { "status": 400, "code": "INVALID_REQUEST", "when": "field length limits exceeded" },
+        { "status": 401, "code": "ACCOUNT_INACTIVE", "when": "account deactivated" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "per-IP budget (scope desktop_exchange_ip)" }
+      ]
+    },
+    {
+      "id": "me", "method": "GET", "path": "/v1/me", "auth": "session (read-budgeted: 60 req/min/user)",
+      "summary": "Server-authoritative identity + effective plan + limits + model entitlements + live quota position (the exact sums the enforcement gate reads)",
+      "request": null,
+      "response_status": 200,
+      "response": {
+        "user": { "id": "usr_2y8M", "email": "asha@example.com", "display_name": "Asha", "avatar_url": "https://lh3.googleusercontent.com/…", "status": "active", "is_platform_admin": false, "email_verified": true },
+        "tenant": { "id": "tn_7Qk1", "slug": "asha-firm", "name": "Asha & Co", "status": "active" },
+        "membership": { "role": "owner", "status": "active" },
+        "subscription_status": "active",
+        "plan": { "id": "pln_pro", "code": "pro", "name": "Pro" },
+        "limits": {
+          "requests_per_minute_user": 60,
+          "requests_per_minute_tenant": 300,
+          "concurrent_requests_user": 8,
+          "concurrent_requests_tenant": 32,
+          "max_request_bytes": 2097152,
+          "window_5h_tokens": 60000,
+          "window_weekly_tokens": 500000
+        },
+        "models": ["openai/gpt-6-luna", "google/gemini-3-flash"],
+        "restricted": true,
+        "quota": {
+          "currency": "normalized_tokens",
+          "windows": [
+            { "window": "5h", "used_tokens": 12400, "quota_tokens": 60000, "used_percent": 20, "resets_at": null },
+            { "window": "weekly", "used_tokens": 503210, "quota_tokens": 500000, "used_percent": 100, "resets_at": "2026-11-08T04:12:55Z" }
+          ]
+        }
+      },
+      "response_rules": [
+        "plan.code = \"free\" for every tenant without an active subscription — always renderable",
+        "models = allowlist when restricted=true; any model when false",
+        "resets_at is null unless used_tokens >= quota_tokens; then it is the exact earliest recovery instant (schedule retries with it)",
+        "used_percent is floor'd and capped at 100 — 99% may still admit; 100% exactly when the gate rejects",
+        "whole quota block OMITTED on aggregation failure — render \"usage unavailable\", never zeros"
+      ],
+      "errors": [
+        { "status": 429, "code": "RATE_LIMITED", "when": "read budget (scope read_rpm)" },
+        { "status": 401, "code": "UNAUTHORIZED | TOKEN_EXPIRED | TOKEN_REVOKED", "when": "bad or expired token" }
+      ]
+    },
+    {
+      "id": "config", "method": "GET", "path": "/v1/config", "auth": "session",
+      "summary": "Client integration config: transports, request limits, stream semantics, model list. No secrets",
+      "request": null,
+      "response_status": 200,
+      "response": {
+        "version": "v1",
+        "transports": {
+          "llm": "POST /v1/chat/completions (OpenAI-compatible; model = \"provider/model\"; SSE when stream=true)",
+          "events": "OpenAI chat-completions chunks, forwarded verbatim"
+        },
+        "limits": { "max_request_bytes": 2097152, "max_messages": 256, "max_tools": 128, "max_model_len": 256 },
+        "stream": { "idle_timeout_s": 300, "max_duration_s": 900, "heartbeat_s": 15, "terminal_event": "data: [DONE]" },
+        "models": ["openai/gpt-6-luna", "google/gemini-3-flash"],
+        "restricted": true,
+        "server_time": "2026-11-07T09:00:00Z"
+      },
+      "response_rules": ["models is null when the tenant is unrestricted"]
+    },
+    {
+      "id": "chat-completions", "method": "POST", "path": "/v1/chat/completions", "auth": "device (web tokens => 403)",
+      "summary": "THE LLM ENDPOINT: OpenAI-compatible pass-through tunnel to OpenRouter (model = \"provider/model\"); JSON or SSE",
+      "request": {
+        "model": "openai/gpt-6-luna",
+        "messages": [
+          { "role": "system", "content": "You are a careful assistant." },
+          { "role": "user", "content": "hello" }
+        ],
+        "stream": true,
+        "tools": [{ "type": "function", "function": { "name": "get_weather", "parameters": {} } }],
+        "tool_choice": "auto",
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_completion_tokens": 1024,
+        "max_tokens": 1024,
+        "stop": ["\n\n"],
+        "seed": 42,
+        "frequency_penalty": 0,
+        "presence_penalty": 0,
+        "logit_bias": { "50256": -100 },
+        "logprobs": false,
+        "top_logprobs": 5,
+        "parallel_tool_calls": true,
+        "response_format": { "type": "json_object" },
+        "reasoning_effort": "medium",
+        "fallbacks": ["anthropic/claude-sonnet-5.5"],
+        "metadata": { "session": "abc" }
+      },
+      "request_rules": [
+        "messages roles: system|user|assistant|tool|developer; content = string or OpenAI content-parts array",
+        "unknown top-level keys pass through (bounded, JSON-typed) — new provider params need no cloud release",
+        "body larger than the plan max_request_bytes => 413 PAYLOAD_TOO_LARGE (details.limit_bytes)"
+      ],
+      "response_status": 200,
+      "response_non_stream": "upstream completion JSON forwarded verbatim (OpenAI shape: id, object, choices[], usage{})",
+      "response_stream": {
+        "content_type": "text/event-stream",
+        "frames": "data: {openai-style chunk}\\n\\n",
+        "keepalive": ": ping comments every heartbeat_s — ignore, never treat as data",
+        "usage": "rides the final data frame(s) when the upstream includes it",
+        "terminal": "data: [DONE]\\n\\n",
+        "in_band_error": { "error": { "message": "stream exceeded the maximum duration", "type": "…", "code": "MAX_DURATION" } },
+        "commit_rule": "HTTP 200 + SSE headers commit only on first upstream byte — pre-stream failures answer as real HTTP errors",
+        "cuts": ["max_duration_s => MAX_DURATION", "idle_timeout_s => MODEL_TIMEOUT"]
+      },
+      "response_headers": "X-Ratelimit-* set (see rate_limit_headers)",
+      "errors": [
+        { "status": 400, "code": "INVALID_REQUEST", "when": "malformed payload, bad model format, too many messages/tools" },
+        { "status": 401, "code": "UNAUTHORIZED | TOKEN_EXPIRED | TOKEN_REVOKED", "when": "bad or expired token" },
+        { "status": 403, "code": "FORBIDDEN", "when": "web session token on a device-only route" },
+        { "status": 403, "code": "MODEL_NOT_ENTITLED", "when": "model not in tenant allowlist (details.model)" },
+        { "status": 403, "code": "TENANT_SUSPENDED", "when": "tenant suspended" },
+        { "status": 413, "code": "PAYLOAD_TOO_LARGE", "when": "body over plan byte ceiling (details.limit_bytes)" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "per-minute budget (details.scope, retry_after_ms)" },
+        { "status": 429, "code": "CONCURRENCY_LIMIT", "when": "concurrent-stream ceiling (details.scope)" },
+        { "status": 429, "code": "WINDOW_QUOTA_EXCEEDED", "when": "5h/weekly token budget exhausted (details.resets_at)" },
+        { "status": 502, "code": "UPSTREAM_UNAVAILABLE | UPSTREAM_PROTOCOL", "when": "OpenRouter failure" },
+        { "status": 503, "code": "SERVER_SHUTDOWN", "when": "server draining — retry with backoff" },
+        { "status": 504, "code": "MODEL_TIMEOUT", "when": "model request timed out" }
+      ]
+    },
+    {
+      "id": "usage", "method": "GET", "path": "/v1/usage", "auth": "device (read-budgeted)",
+      "summary": "Tenant-scoped usage aggregation over a window (authoritative metered numbers, never client-reported)",
+      "request": "query params (all optional): days (int 1..366, default 30) | from & to (RFC3339, from < to, span <= 366d) | by_model=true",
+      "response_status": 200,
+      "response": {
+        "tenant_id": "tn_7Qk1",
+        "from": "2026-10-08T09:00:00Z",
+        "to": "2026-11-07T09:00:00Z",
+        "calls": 214,
+        "input_tokens": 812345,
+        "output_tokens": 391204,
+        "total_tokens": 1203549,
+        "reasoning_tokens": 50211,
+        "cache_read_tokens": 120433,
+        "cache_write_tokens": 8801,
+        "total_cost": 17.42,
+        "by_model": [
+          { "model": "openai/gpt-6-luna", "calls": 190, "input_tokens": 770001, "output_tokens": 350000, "total_tokens": 1120001, "total_cost": 15.9 },
+          { "model": "google/gemini-3-flash", "calls": 24, "input_tokens": 42344, "output_tokens": 41204, "total_tokens": 83548, "total_cost": 1.52 }
+        ]
+      },
+      "response_rules": [
+        "by_model present only when by_model=true; sorted by total_tokens DESC",
+        "total_cost is USD as billed by the upstream"
+      ],
+      "errors": [
+        { "status": 400, "code": "INVALID_REQUEST", "when": "days out of [1,366], non-RFC3339 from/to, from >= to, span > 366d" },
+        { "status": 403, "code": "FORBIDDEN", "when": "web session token" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "read budget (scope read_rpm)" }
+      ]
+    },
+    {
+      "id": "payments-catalog", "method": "GET", "path": "/v1/payments/catalog", "auth": "session",
+      "summary": "Purchasable plan SKUs (plans only — no credit packs)",
+      "request": null,
+      "response_status": 200,
+      "response": {
+        "skus": [
+          { "id": "plan_pro_1m", "label": "Pro — ₹1,999 / month", "plan_code": "pro", "period_days": 30, "amount_paise": 199900, "badge": "Popular" },
+          { "id": "plan_pro_1y", "label": "Pro — ₹19,999 / year", "plan_code": "pro", "period_days": 365, "amount_paise": 1999900, "badge": "Best value" }
+        ]
+      },
+      "errors": [{ "status": 503, "code": "PAYMENTS_DISABLED", "when": "payments not enabled on deployment — hide purchase UI" }]
+    },
+    {
+      "id": "payments-checkout", "method": "POST", "path": "/v1/payments/checkout", "auth": "session",
+      "summary": "Create a payment order; response relays the provider's browser handles",
+      "request_headers": { "Idempotency-Key": "send on EVERY call (unique string kept for retries) — network retries must never fork orders" },
+      "request": { "sku_id": "plan_pro_1m" },
+      "response_status": 201,
+      "response": {
+        "order": { "order_id": "ord_9c31", "status": "pending" },
+        "key_id": "public provider key id",
+        "provider": "phonepe",
+        "provider_order_id": "PAY-9c31-…",
+        "redirect_url": "https://pay.phonepe.com/…"
+      },
+      "provider_handles": {
+        "redirect_url": "phonepe — send the browser there wholesale",
+        "client_secret": "stripe — Stripe.js handle",
+        "key_id": "razorpay — Checkout.js key (public by design)"
+      },
+      "errors": [
+        { "status": 404, "code": "SKU_NOT_FOUND", "when": "unknown sku_id (details.sku_id)" },
+        { "status": 409, "code": "DUPLICATE_IN_PROGRESS", "when": "identical checkout in flight — retry same Idempotency-Key" },
+        { "status": 409, "code": "PLAN_NOT_CONFIGURED", "when": "SKU's plan missing on deployment" },
+        { "status": 422, "code": "IDEMPOTENCY_KEY_REUSE", "when": "same Idempotency-Key with a different body" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "checkout budget (scope checkout_user)" },
+        { "status": 503, "code": "PAYMENTS_DISABLED", "when": "payments off" }
+      ]
+    },
+    {
+      "id": "payments-confirm", "method": "POST", "path": "/v1/payments/confirm", "auth": "session",
+      "summary": "Settle after paying (3-legged verification; server-side fetch is the authority for stripe/phonepe)",
+      "request": { "provider_order_id": "PAY-9c31-…", "provider_payment_id": "T2311…", "provider_signature": "…" },
+      "request_aliases": {
+        "razorpay": ["razorpay_order_id", "razorpay_payment_id", "razorpay_signature"],
+        "stripe": ["payment_intent_id (+ optional client_secret)"],
+        "phonepe": ["merchant_transaction_id"]
+      },
+      "resolution_order": "generic -> razorpay -> stripe/phonepe variants",
+      "response_status": 200,
+      "response": "{ \"order\": { …full order object, status \"paid\"… } }",
+      "errors": [
+        { "status": 400, "code": "INVALID_REQUEST", "when": "missing order/payment ids" },
+        { "status": 400, "code": "PAYMENT_SIGNATURE_INVALID", "when": "confirm proof failed" },
+        { "status": 404, "code": "NOT_FOUND", "when": "cross-tenant order" },
+        { "status": 409, "code": "ORDER_NOT_OPEN", "when": "order already settled/expired (details.status)" },
+        { "status": 409, "code": "PAYMENT_AMOUNT_MISMATCH", "when": "provider amount != order (details.expected_paise, received_paise)" },
+        { "status": 429, "code": "RECONCILE_RATE_LIMITED", "when": "too many status checks" }
+      ]
+    },
+    {
+      "id": "payments-order", "method": "GET", "path": "/v1/payments/orders/{order_id}", "auth": "session",
+      "summary": "One order's status; reconciles with the provider when still pending (bounded rate)",
+      "request": "path param: order_id",
+      "response_status": 200,
+      "response": { "order": { "order_id": "ord_9c31", "status": "paid", "…": "full ClientView" } },
+      "errors": [
+        { "status": 404, "code": "NOT_FOUND", "when": "unknown or cross-tenant order" },
+        { "status": 429, "code": "RECONCILE_RATE_LIMITED", "when": "too many status checks" }
+      ]
+    },
+    {
+      "id": "payments-history", "method": "GET", "path": "/v1/payments/history", "auth": "session",
+      "summary": "Tenant orders, newest first",
+      "request": "query: limit (clamped to [1,100], default 50)",
+      "response_status": 200,
+      "response": { "orders": [] },
+      "errors": []
+    },
+    {
+      "id": "payments-subscription", "method": "GET", "path": "/v1/payments/subscription", "auth": "session",
+      "summary": "The entitlement position: effective plan, paid-through date, days remaining (the subscription IS the wallet — no credits)",
+      "request": null,
+      "response_status": 200,
+      "response": {
+        "tenant_id": "tn_7Qk1",
+        "plan_code": "pro",
+        "plan_name": "Pro",
+        "status": "active",
+        "current_period_end": "2026-12-07T08:43:02Z",
+        "days_remaining": 29
+      },
+      "response_rules": [
+        "status in: active | trialing | past_due | none",
+        "none => plan_code \"\", current_period_end absent, days_remaining 0 (free default)",
+        "period end simply flips the read back to none — no sweeper, no prorating"
+      ],
+      "errors": [{ "status": 503, "code": "PAYMENTS_DISABLED", "when": "payments off" }]
+    },
+    {
+      "id": "payments-webhook", "method": "POST", "path": "/v1/payments/webhook", "auth": "provider signature (NOT for frontends)",
+      "summary": "Provider-to-server events; signature over the raw body is the entire auth. Never call this from your app",
+      "request": "provider-specific body + signature header (X-Razorpay-Signature | Stripe-Signature | X-VERIFY)",
+      "response_status": 200,
+      "response": "empty body (200 only after the state change committed)",
+      "errors": [
+        { "status": 401, "code": "WEBHOOK_SIGNATURE_INVALID", "when": "signature failed" },
+        { "status": 429, "code": "RATE_LIMITED", "when": "webhook IP budget (scope webhook_ip)" }
+      ]
+    }
+  ],
+  "order_object": {
+    "description": "every order-bearing response wraps this same object in {\"order\": …}",
+    "fields": {
+      "order_id": "string",
+      "provider_order_id": "string",
+      "provider_payment_id": "string (once a payment exists)",
+      "provider": "mock | razorpay | stripe | phonepe",
+      "sku_id": "string",
+      "plan_code": "string",
+      "period_days": "int",
+      "currency": "INR",
+      "amount_paise": "int",
+      "status": "pending | attempted | paid | failed | expired",
+      "failure_reason": "string (failed only)",
+      "created_at": "RFC3339",
+      "paid_at": "RFC3339 (once paid)",
+      "expires_at": "RFC3339 (order TTL 15m; late capture honored 24h)"
+    },
+    "state_machine": "pending -> attempted -> paid (absorbing) | failed; expired when TTL lapses"
+  },
+  "rate_limit_headers": [
+    { "header": "X-Ratelimit-Limit-Requests", "meaning": "per-minute request ceiling (user scope)" },
+    { "header": "X-Ratelimit-Remaining-Requests", "meaning": "requests left this minute (this call counted)" },
+    { "header": "X-Ratelimit-Limit-Concurrency", "meaning": "concurrent-stream ceiling" },
+    { "header": "X-Ratelimit-Active-Concurrency", "meaning": "holders observed at claim time (you included)" },
+    { "header": "X-Ratelimit-Limit-Tokens", "meaning": "5h normalized-token budget" },
+    { "header": "X-Ratelimit-Remaining-Tokens", "meaning": "5h budget left (metered + reservations)" },
+    { "header": "X-Ratelimit-Limit-Tokens-Weekly", "meaning": "weekly budget" },
+    { "header": "X-Ratelimit-Remaining-Tokens-Weekly", "meaning": "weekly budget left" }
+  ],
+  "rate_limit_header_rules": [
+    "omitted when the plan does not set the dimension or the value is unknown",
+    "on 429 the exhausted dimension's remaining-header is pinned to 0"
+  ],
+  "error_codes": [
+    { "code": "INVALID_REQUEST", "http": 400, "details": null, "when": "malformed JSON, bad/missing fields, bad query params" },
+    { "code": "INVALID_OR_EXPIRED_CODE", "http": 400, "details": null, "when": "bad/replayed/expired grant or mcode" },
+    { "code": "OAUTH_STATE_INVALID", "http": 400, "details": null, "when": "OAuth state replay / tx-cookie mismatch" },
+    { "code": "UNAUTHORIZED", "http": 401, "details": null, "when": "missing/garbage Bearer token" },
+    { "code": "TOKEN_EXPIRED", "http": 401, "details": null, "when": "access token past expiry — refresh and retry" },
+    { "code": "TOKEN_REVOKED", "http": 401, "details": null, "when": "access token blacklisted (logout-all)" },
+    { "code": "REFRESH_TOKEN_EXPIRED", "http": 401, "details": null, "when": "refresh token past 30 days — sign in again" },
+    { "code": "REFRESH_TOKEN_REUSED", "http": 401, "details": null, "when": "reuse detected — all sessions revoked — sign in again" },
+    { "code": "ACCOUNT_INACTIVE", "http": 401, "details": null, "when": "user or account deactivated" },
+    { "code": "FORBIDDEN", "http": 403, "details": null, "when": "web token on device-only route; account state" },
+    { "code": "TENANT_SUSPENDED", "http": 403, "details": null, "when": "tenant suspended" },
+    { "code": "SUBSCRIPTION_INACTIVE", "http": 403, "details": null, "when": "no active subscription where one is required" },
+    { "code": "MODEL_NOT_ENTITLED", "http": 403, "details": ["model"], "when": "model not in tenant allowlist" },
+    { "code": "OAUTH_EMAIL_UNVERIFIED", "http": 403, "details": null, "when": "Google email not verified" },
+    { "code": "NOT_FOUND", "http": 404, "details": null, "when": "unknown route or order id" },
+    { "code": "METHOD_NOT_ALLOWED", "http": 405, "details": ["allow"], "when": "wrong verb (Allow header)" },
+    { "code": "IDEMPOTENCY_KEY_REUSE", "http": 422, "details": null, "when": "same Idempotency-Key, different body" },
+    { "code": "PAYLOAD_TOO_LARGE", "http": 413, "details": ["limit_bytes"], "when": "body over the plan's byte ceiling" },
+    { "code": "IDENTITY_CONFLICT", "http": 409, "details": null, "when": "email already linked to another identity" },
+    { "code": "RATE_LIMITED", "http": 429, "details": ["scope", "retry_after_ms"], "when": "RPM/read/checkout/webhook budget (+ Retry-After header)" },
+    { "code": "CONCURRENCY_LIMIT", "http": 429, "details": ["scope"], "when": "concurrent-stream ceiling reached" },
+    { "code": "WINDOW_QUOTA_EXCEEDED", "http": 429, "details": ["window", "quota_tokens", "used_tokens", "resets_at"], "when": "5h or weekly token budget exhausted — schedule with resets_at" },
+    { "code": "INTERNAL", "http": 500, "details": null, "when": "server fault (quote request_id)" },
+    { "code": "UPSTREAM_UNAVAILABLE", "http": 502, "details": null, "when": "OpenRouter unreachable" },
+    { "code": "UPSTREAM_PROTOCOL", "http": 502, "details": null, "when": "malformed upstream response" },
+    { "code": "OAUTH_PROVIDER_ERROR", "http": 502, "details": null, "when": "Google leg failed" },
+    { "code": "PAYMENT_PROVIDER_AUTH", "http": 502, "details": null, "when": "provider rejected deployment credentials" },
+    { "code": "PAYMENT_PROVIDER_ERROR", "http": 502, "details": null, "when": "provider rejected the request" },
+    { "code": "MODEL_TIMEOUT", "http": 504, "details": ["scope"], "when": "model request timed out" },
+    { "code": "SERVER_SHUTDOWN", "http": 503, "details": null, "when": "server draining — retry with backoff" },
+    { "code": "OAUTH_DISABLED", "http": 503, "details": null, "when": "OAuth not configured on deployment" },
+    { "code": "PAYMENTS_DISABLED", "http": 503, "details": null, "when": "payments not enabled on deployment" },
+    { "code": "DEPENDENCY_UNAVAILABLE", "http": 503, "details": ["dependency"], "when": "PG/Redis down" },
+    { "code": "UNSUPPORTED_AUTH_MODE", "http": 501, "details": null, "when": "deployment mints no tokens" },
+    { "code": "SKU_NOT_FOUND", "http": 404, "details": ["sku_id"], "when": "unknown sku_id at checkout" },
+    { "code": "PLAN_NOT_CONFIGURED", "http": 409, "details": ["plan_code"], "when": "SKU's plan missing on deployment" },
+    { "code": "ORDER_NOT_OPEN", "http": 409, "details": ["status"], "when": "order already settled/expired" },
+    { "code": "PAYMENT_SIGNATURE_INVALID", "http": 400, "details": null, "when": "confirm proof failed" },
+    { "code": "PAYMENT_AMOUNT_MISMATCH", "http": 409, "details": ["expected_paise", "received_paise"], "when": "provider amount != order" },
+    { "code": "DUPLICATE_IN_PROGRESS", "http": 409, "details": null, "when": "identical checkout in flight — retry same key" },
+    { "code": "RECONCILE_RATE_LIMITED", "http": 429, "details": null, "when": "too many order-status checks" },
+    { "code": "WEBHOOK_SIGNATURE_INVALID", "http": 401, "details": null, "when": "webhook signature failed (server-to-server)" }
+  ],
+  "sse_in_band_error_codes": ["MAX_DURATION", "MODEL_TIMEOUT", "SERVER_SHUTDOWN", "CLIENT_DISCONNECTED"],
+  "journeys": {
+    "desktop_login": [
+      "GET /v1/auth/oauth/google in the system browser",
+      "callback 302 -> web success page ?grant=…",
+      "web page POSTs grant to /v1/auth/web/session -> 15-min web token",
+      "web page POSTs /v1/auth/desktop/code -> {code, expires_in:60}",
+      "code travels to the desktop (deep link or loopback)",
+      "desktop POSTs /v1/auth/desktop/exchange -> TokenPair",
+      "before expires_in runs out: POST /v1/auth/refresh and REPLACE the stored pair"
+    ],
+    "buy_pro_phonepe": [
+      "GET /v1/payments/catalog -> render SKUs",
+      "POST /v1/payments/checkout (with Idempotency-Key) -> redirect_url",
+      "send the browser to redirect_url; user pays",
+      "POST /v1/payments/confirm (ids from checkout + provider) -> order paid (or poll GET /v1/payments/orders/{id} until the webhook lands)",
+      "GET /v1/payments/subscription and GET /v1/me now show Pro ceilings"
+    ]
+  }
+}

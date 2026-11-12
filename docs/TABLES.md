@@ -16,7 +16,7 @@ Identity & tenancy     tenants · users · tenant_members
 Plans & entitlement    plans · subscriptions · entitlements
 Devices & sessions     devices · refresh_tokens
 Usage & accounting     llm_calls · token_normalization
-Payments & plans      payment_orders · payment_webhook_events (plans only — the credit tables were dropped in 000012; subscriptions IS the wallet)
+Payments & plans      payment_orders · payment_webhook_events (plans only — the credit tables were dropped in 000012 and no longer exist; subscriptions IS the wallet)
 ```
 
 ---
@@ -246,7 +246,7 @@ stored** — tokens, cost, latency, status only.
 | `input_tokens`, `output_tokens`, `total_tokens` | BIGINT | **normalized** values (quota currency); `total = input + output` |
 | `raw_prompt_tokens`, `raw_completion_tokens` | BIGINT | provider-reported numbers (audit; added in 0008) |
 | `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens` | BIGINT | raw breakdowns |
-| `input_cost`, `output_cost`, `total_cost` | NUMERIC(18,8) | Bifrost-reported costs |
+| `input_cost`, `output_cost`, `total_cost` | NUMERIC(18,8) | OpenRouter-reported costs (USD; usage.cost + cost_details) |
 | `latency_ms`, `started_at`, `completed_at`, `recorded_at` | | timing; `recorded_at` is the window-math column |
 
 Indexes: `(tenant_id, recorded_at DESC)` — the exact path the 5h/weekly

@@ -3,7 +3,7 @@
 The cloud layer does exactly four things: **identity** (Google OAuth only),
 **entitlements** (plans, quotas, rate limits), **billing** (plan subscriptions — PhonePe default, Razorpay/Stripe selectable
 top-ups) and the **LLM tunnel** (`POST /v1/chat/completions` → private
-Bifrost gateway). Everything agent-related — sessions, transcripts, tools,
+OpenRouter, direct upstream). Everything agent-related — sessions, transcripts, tools,
 files, execution — lives on the user's desktop and never crosses this API
 except as opaque request payloads.
 
@@ -77,7 +77,7 @@ never cross the browser — only single-use short-TTL codes do.
 ### `POST /v1/chat/completions` — tunnel to the model gateway
 
 OpenAI Chat Completions-compatible. Point the desktop agent runtime's
-OpenAI-style client here. The model MUST be `"provider/model"` (Bifrost
+OpenAI-style client here. The model MUST be `"vendor/model"` (OpenRouter
 routing format), e.g. `openai/gpt-4o`, `anthropic/claude-3-5-sonnet`.
 
 ```json
@@ -102,7 +102,7 @@ Pipeline (in order, all before any upstream traffic):
    back below quota; clients schedule the retry from it)
 6. **Rate limits** — RPM per user + per tenant (Redis sliding window, `RATE_LIMITED` 429 with `retry_after_ms`)
 7. **Concurrency** — in-flight LLM calls per user + per tenant (`CONCURRENCY_LIMIT` 429)
-8. **Tunnel** — forward to the private Bifrost gateway (cloud-side credential; clients never see provider keys)
+8. **Tunnel** — forward to OpenRouter with the cloud-side credential (clients never see provider keys)
 
 **stream=true (default for agent use)** — SSE:
 
@@ -124,6 +124,27 @@ data: [DONE]
   far is still metered (status `cancelled`).
 
 **stream=false** — the completion JSON body (verbatim upstream shape).
+
+**Rate-limit response headers** — every chat-completions response (200 and
+429-class) carries the admission position as industry-standard client hints,
+so a desktop agent renders a live usage meter without polling `/v1/me`:
+
+| Header | Meaning | Present |
+|---|---|---|
+| `X-Ratelimit-Limit-Requests` | effective requests/min, user scope (plan override applied) | always (dimension enabled) |
+| `X-Ratelimit-Remaining-Requests` | events left in the rolling minute, this call counted | when known |
+| `X-Ratelimit-Limit-Concurrency` | effective concurrent-stream ceiling, user scope | always (dimension enabled) |
+| `X-Ratelimit-Active-Concurrency` | holders observed at claim time, this call included | when known |
+| `X-Ratelimit-Limit-Tokens` | plan 5-hour window budget (normalized tokens) | always (dimension enabled) |
+| `X-Ratelimit-Remaining-Tokens` | budget minus metered usage minus live in-flight reservations | when known |
+| `X-Ratelimit-Limit-Tokens-Weekly` / `-Remaining-Tokens-Weekly` | same for the 7-day window | always / when known |
+
+Semantics: unknown values (e.g. Redis degraded) are **omitted, never
+guessed**; disabled dimensions are omitted entirely; on a 429 the exhausted
+dimension's remaining header reads `0` (plus the `Retry-After` HTTP header on
+`RATE_LIMITED`). On streams the headers ride the SSE 200 itself — they are
+applied at admission time, before the first upstream byte commits the
+response.
 
 **Per-call guarantees**: one `llm_calls` row records the fact (tokens, cost,
 latency, resolved model, status) for quota accounting and usage display.
@@ -235,7 +256,7 @@ internals: `docs/PAYMENT-GATEWAY.md`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health/live` | Process liveness (never touches dependencies) |
-| GET | `/health/ready` | PG/Redis/Bifrost probes + breaker state (Bifrost never gates readiness) |
+| GET | `/health/ready` | PG/Redis/OpenRouter probes + breaker state (upstream never gates readiness) |
 | GET | `/metrics` | Prometheus (when enabled) |
 
 ---

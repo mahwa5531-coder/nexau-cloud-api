@@ -1,4 +1,4 @@
-package bifrost
+package openrouter
 
 // breaker_test.go — exhaustive coverage of the upstream circuit breaker:
 // state transitions, both trip modes, cooldown backoff growth and cap,
@@ -423,7 +423,7 @@ func TestCB_ClientRecoveryEndToEnd(t *testing.T) {
 		if s == 200 {
 			_, _ = io.WriteString(w, `{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}]}`)
 		} else {
-			_, _ = io.WriteString(w, `{"event_id":"e","type":"error","is_bifrost_error":true,"status_code":503,"error":{"type":"gateway_error","code":"503","message":"down"}}`)
+			_, _ = io.WriteString(w, `{"error":{"code":503,"message":"down"}}`)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -561,9 +561,10 @@ func TestCB_ClientCancellationNeverCounts(t *testing.T) {
 }
 
 func TestCB_InBandProviderErrorKeepsClosed(t *testing.T) {
-	// A 200 SSE stream carrying an in-band BifrostError: provider problem,
-	// gateway alive → breaker stays closed.
-	inBand := `{"id":"cmpl_x","object":"chat.completion.chunk","model":"openai/gpt-4o","type":"error","is_bifrost_error":true,"status_code":500,"error":{"type":"provider_error","code":"500","message":"provider exploded"}}`
+	// A 200 SSE stream carrying an in-band error payload (OpenRouter
+	// mid-stream failure): provider problem, gateway alive → breaker
+	// stays closed.
+	inBand := `{"id":"cmpl_x","object":"chat.completion.chunk","model":"openai/gpt-4o","error":{"code":500,"message":"provider exploded"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: "+inBand+"\n\n")
@@ -631,7 +632,7 @@ func TestCB_GateErrorIsDomainError(t *testing.T) {
 		t.Fatalf("circuit detail = %v", de.Details["circuit"])
 	}
 	// Message hygiene: no internal leakage.
-	for _, banned := range []string{"bifrost", "127.0.0.1", "sk-", "goroutine"} {
+	for _, banned := range []string{"openrouter", "127.0.0.1", "sk-or-", "goroutine"} {
 		if contains(de.Message, banned) {
 			t.Fatalf("message leaks %q", banned)
 		}

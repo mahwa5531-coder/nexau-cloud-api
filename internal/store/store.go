@@ -34,9 +34,27 @@ func NewPostgres(ctx context.Context, url string, maxConns, minConns int32, maxL
 	cfg.MaxConnLifetime = maxLifetime
 	cfg.MaxConnIdleTime = maxLifetime / 3
 	cfg.HealthCheckPeriod = 30 * time.Second
-	// Statement-level timeout: guards runaway queries; set per-statement by
-	// repositories with their own budgets via context deadlines.
 	cfg.ConnConfig.ConnectTimeout = 10 * time.Second
+
+	// Server-side budgets (audit H8) — previously a comment here CLAIMED
+	// statement-level protection existed while none was set. One runaway
+	// query could hold its pooled connection forever: the pool drained,
+	// health checks failed, and a local slowdown became a full-service
+	// outage with zero self-recovery. PostgreSQL enforces these per
+	// session; every pooled connection inherits them:
+	//   - statement_timeout: no single query outlives 30s (the heaviest
+	//     legit queries are indexed ms-scale window sums; migrations run
+	//     on a dedicated connection with a relaxed budget — migrate.go);
+	//   - lock_timeout: fail loudly after 5s waiting on a row/table lock
+	//     instead of queueing behind a Sunday-analyst transaction;
+	//   - idle_in_transaction_session_timeout: 60s — an abandoned open
+	//     transaction is killed, releasing its locks.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "30s"
+	cfg.ConnConfig.RuntimeParams["lock_timeout"] = "5s"
+	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "60s"
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

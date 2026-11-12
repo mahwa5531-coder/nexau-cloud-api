@@ -1,5 +1,5 @@
 // Package reqctx carries the canonical per-request correlation keys.
-// Exactly one key type per concept: middleware sets, bifrost/agent/api read.
+// Exactly one key type per concept: middleware sets, openrouter/agent/api read.
 // Duplicated ad-hoc key types would silently never match.
 package reqctx
 

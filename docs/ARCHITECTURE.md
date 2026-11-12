@@ -11,14 +11,14 @@
 │  workspaces, files       │────────▶│  │  auth   │   │ payments │  │
 │  transcripts, sessions   │         │  └─────────┘   └──────────┘  │
 │  tools, execution        │         │  ┌─────────┐   ┌──────────┐  │      ┌────────────┐
-│  retry/state machines    │         │  │ quotas  │──▶│ LLM      │──┼─────▶│  Bifrost   │
-│                          │         │  │ limits  │   │ tunnel   │  │      │ (private)  │
-└──────────────────────────┘         │  └─────────┘   └──────────┘  │      └────────────┘
-          ▲                          └─────────────────────────────┘         │
-          │ Google OAuth (browser)                ▲                          ▼
-          └────────────────────────────────────────┤                 OpenAI / Anthropic /
-                                                   │                 DeepSeek / …
-                                       PostgreSQL + Redis (Aiven)    (via Bifrost only)
+│  retry/state machines    │         │  │ quotas  │──▶│ LLM      │──┼─────▶│ OpenRouter │
+│                          │         │  │ limits  │   │ tunnel   │  │      │ (direct,   │
+└──────────────────────────┘         │  └─────────┘   └──────────┘  │      │  HTTPS)    │
+          ▲                          └─────────────────────────────┘      └──────┬───────┘
+          │ Google OAuth (browser)                ▲                              │
+          └────────────────────────────────────────┤                       OpenAI / Anthropic /
+                                                   │                       Google / … (BYOK)
+                                       PostgreSQL + Redis (Aiven)         provider routing
 ```
 
 **Responsibility split (the contract this codebase enforces):**
@@ -31,8 +31,8 @@
 | Subscriptions, plans, quotas, credits | Cloud |
 | Billing (Razorpay) | Cloud |
 | Rate limiting per plan | Cloud |
-| LLM access (tunnel to Bifrost) | Cloud |
-| Provider keys / routing / fallbacks | **Bifrost** (cloud never sees provider keys) |
+| LLM access (tunnel to OpenRouter) | Cloud |
+| Provider routing / fallbacks across providers | **OpenRouter** (BYOK keys live in the OpenRouter account) |
 
 The desktop never talks to OpenAI/Anthropic/DeepSeek/Razorpay/Google directly —
 only to this API and (browser-only) Google's consent screen.
@@ -46,9 +46,9 @@ internal/api/          HTTP surface: router + 15 handlers (auth, me, config,
 internal/auth/         Google OAuth + web-to-desktop handshake + refresh
                        rotation + identity resolver + middleware
 internal/llm/          THE proxy: request validation, SSE writer, tunnel
-                       service (entitlement → quota → rate limits → Bifrost)
-internal/bifrost/      upstream client: transport, retries, circuit breaker,
-                       SSE stream reader, error normalization
+                       service (entitlement → quota → rate limits → upstream)
+internal/openrouter/   direct upstream client: transport, retries, circuit
+                       breaker, SSE stream reader, error normalization
 internal/ratelimit/    Redis Lua sliding window + concurrency slots
 internal/metering/     async bounded llm_calls recorder (batch, exactly-once)
 internal/payment/      credit top-ups: orders, ledger, webhook, sweeper
@@ -84,15 +84,15 @@ llm.Proxy.admit  ──  account/tenant/membership/subscription state
      │               RPM sliding window  (rl:rpm:user:*, rl:rpm:tenant:*)
      │               concurrency slots   (rl:conc:user:*, rl:conc:tenant:*)
      ▼
-bifrost.Client ──▶ POST {Bifrost}/v1/chat/completions  (Bearer cloud key,
-                    x-request-id + x-mash-call-id + traceparent, retries
-                    pre-first-byte only, circuit breaker)
+openrouter.Client ─▶ POST https://openrouter.ai/api/v1/chat/completions
+                    (Bearer OpenRouter key, x-request-id + x-mash-call-id +
+                    traceparent, retries pre-first-byte only, circuit breaker)
      │
      ├── stream=true:  StreamReader.Next() ──▶ SSE verbatim passthrough
      │                 (lazy headers, heartbeats, [DONE], in-band errors
      │                 after first byte, write deadlines)
      │
-     └── stream=false: bounded by BifrostReqTimeout, verbatim JSON body
+     └── stream=false: bounded by UpstreamReqTimeout, verbatim JSON body
      │
      ▼
 metering.Recorder ──▶ one llm_calls row (call_id, tokens, cost, latency,
@@ -150,7 +150,7 @@ databases from the pre-cleanup schema must be re-provisioned** — see
 - **Scaling**: stateless API replicas; all cross-instance state is Redis
   (sliding windows, slot counters). No sticky sessions; SSE needs no
   session pinning (streams live and die with one request).
-- **Circuit breaker**: the Bifrost path trips on consecutive failures or
+- **Circuit breaker**: the upstream path trips on consecutive failures or
   failure-rate (fast-fail 503 `UPSTREAM_CIRCUIT_OPEN`), recovers via bounded
   half-open probes — `docs/CIRCUIT-BREAKER.md`.
 - **Shutdown**: stop accepting → drain metering queue (bounded grace) →
@@ -161,7 +161,8 @@ databases from the pre-cleanup schema must be re-provisioned** — see
 
 ## 7. Security invariants
 
-1. Provider keys live only in Bifrost; the cloud holds one Bifrost key.
+1. Provider keys live only in the OpenRouter account (BYOK, shared-capacity
+   fallback disabled); the cloud holds one OpenRouter API key.
 2. Tokens never appear in URLs, logs or the browser beyond single-use codes.
 3. Identity is server-resolved on every authenticated request.
 4. Client-supplied ids (request ids, device ids) are untrusted: rate-limit

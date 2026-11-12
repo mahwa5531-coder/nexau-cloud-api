@@ -1,16 +1,17 @@
-// Package bifrost is the dedicated integration layer for the Bifrost LLM
-// gateway. It speaks Bifrost's OpenAI-compatible chat-completions surface
-// (verified against maximhq/bifrost OpenAPI):
+// Package openrouter is the direct upstream integration: it speaks
+// OpenRouter's OpenAI-compatible chat-completions surface over plain HTTPS
+// (no intermediate gateway process):
 //
-//	POST {base}/v1/chat/completions      model = "provider/model"
-//	Authorization: Bearer {api key}      (cloud-side credential only)
-//	SSE stream: "data: {...}" … "data: [DONE]"
-//	Bifrost standardization: finish_reason + usage arrive in the LAST chunk.
+//	POST {base}/v1/chat/completions      model = "vendor/model"
+//	Authorization: Bearer {OpenRouter API key}   (cloud-side credential only)
+//	SSE stream: ": OPENROUTER PROCESSING" keepalive comments,
+//	            "data: {...}" … "data: [DONE]"
+//	usage (+ cost, is_byok, cost_details) arrives in the final chunk.
 //
 // One shared http.Client per process; connection reuse, HTTP/2, bounded pools.
 // Cancellation propagates via context.Context. Errors are normalized into the
 // domain model with retryability classification.
-package bifrost
+package openrouter
 
 import (
 	"bytes"
@@ -37,8 +38,11 @@ type Client struct {
 
 // TransportConfig carries the tuned, deployment-specific transport settings.
 type TransportConfig struct {
-	BaseURL             string
-	APIKey              string
+	BaseURL             string // e.g. https://openrouter.ai/api
+	APIKey              string // OpenRouter API key; never logged, never returned
+	Referer             string // optional HTTP-Referer attribution header
+	Title               string // optional X-OpenRouter-Title attribution header
+	HealthURL           string // optional override; default {base}/v1/key
 	DialTimeout         time.Duration
 	TLSTimeout          time.Duration
 	ResponseHeaderTO    time.Duration
@@ -111,11 +115,28 @@ func (c *Client) Completion(ctx context.Context, req *ChatRequest) (*ChatRespons
 			// retryability is decided purely by the error classification.
 			return false, bErr
 		}
-		c.cb.recordSuccess() // 2xx headers: gateway is alive
-		dec := json.NewDecoder(io.LimitReader(resp.Body, maxNonStreamBody))
-		cr := &ChatResponse{}
-		if err := dec.Decode(cr); err != nil {
+		c.cb.recordSuccess() // 2xx headers: upstream is alive
+		// Read the body once, verbatim: the struct decode below is
+		// for validation/metering, but the client answer is the raw
+		// bytes (audit M10 — unknown upstream fields must survive
+		// non-streaming calls; a decode/re-marshal pair eats them).
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxNonStreamBody))
+		if rerr != nil {
 			return true, domain.ErrStreamProtocol("malformed upstream response")
+		}
+		cr := &ChatResponse{Raw: raw}
+		if err := json.Unmarshal(raw, cr); err != nil {
+			return true, domain.ErrStreamProtocol("malformed upstream response")
+		}
+		// OpenRouter may commit the response (HTTP 200) and only then fail
+		// at the provider: the body then carries an error object and no
+		// usable choices (docs: "check the body for an error field even on
+		// a 200"). Nothing has been forwarded to our client yet, so the
+		// normal retryability classification decides whether to re-attempt.
+		if cr.IsError() {
+			// OpenRouter answered — it is alive; the provider is not.
+			c.cb.recordSuccess()
+			return false, errorFieldToDomain(cr.Error, 0, 0)
 		}
 		out = cr
 		return true, nil
@@ -128,6 +149,10 @@ func (c *Client) Completion(ctx context.Context, req *ChatRequest) (*ChatRespons
 
 // CompletionStream opens a streaming chat completion. The returned
 // StreamReader must be closed by the caller.
+//
+// OpenRouter keepalive comment lines (": OPENROUTER PROCESSING") are
+// skipped by the reader per the SSE spec; the idle watchdog bounds the
+// gaps between real chunks.
 func (c *Client) CompletionStream(ctx context.Context, req *ChatRequest) (*StreamReader, error) {
 	if err := c.gate(); err != nil {
 		return nil, err
@@ -157,8 +182,8 @@ func (c *Client) CompletionStream(ctx context.Context, req *ChatRequest) (*Strea
 		}
 		// First byte not yet seen: headers arrived but body may still stall.
 		// The reader enforces the idle watchdog from this point on and
-		// reports mid-stream gateway faults to the circuit breaker.
-		c.cb.recordSuccess() // 2xx headers: gateway is alive
+		// reports mid-stream upstream faults to the circuit breaker.
+		c.cb.recordSuccess() // 2xx headers: upstream is alive
 		reader = newStreamReader(ctx, resp.Body, c.metrics, c.cb)
 		return true, nil
 	})
@@ -168,14 +193,23 @@ func (c *Client) CompletionStream(ctx context.Context, req *ChatRequest) (*Strea
 	return reader, nil
 }
 
-// Health probes Bifrost's GET /health for readiness checks. It bypasses
-// the circuit breaker deliberately: readiness reporting stays independent
-// of the serving-path protection (a tripped breaker must not darken the
-// health probe, and a healthy /health must not close a tripped breaker).
+// Health probes GET {base}/v1/key — OpenRouter's authenticated key
+// introspection endpoint: a cheap, un-billed round trip that answers 200
+// while the key (and the service) are usable. It bypasses the circuit
+// breaker deliberately: readiness reporting stays independent of the
+// serving-path protection (a tripped breaker must not darken the health
+// probe, and a healthy key check must not close a tripped breaker).
 func (c *Client) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+"/health", nil)
+	url := c.cfg.HealthURL
+	if url == "" {
+		url = c.cfg.BaseURL + "/v1/key"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
+	}
+	if c.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -185,7 +219,7 @@ func (c *Client) Health(ctx context.Context) error {
 	if resp.StatusCode == http.StatusOK {
 		return nil
 	}
-	return fmt.Errorf("bifrost health: status %d", resp.StatusCode)
+	return fmt.Errorf("openrouter health: status %d", resp.StatusCode)
 }
 
 // CircuitState reports the upstream circuit-breaker state for ops surfaces
@@ -228,6 +262,13 @@ func (c *Client) post(ctx context.Context, body []byte, stream bool) (*http.Resp
 	if c.cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	}
+	// Optional app attribution (OpenRouter rankings; harmless otherwise).
+	if c.cfg.Referer != "" {
+		req.Header.Set("HTTP-Referer", c.cfg.Referer)
+	}
+	if c.cfg.Title != "" {
+		req.Header.Set("X-OpenRouter-Title", c.cfg.Title)
+	}
 	// Correlation: propagate our request id + OTel trace context.
 	if rid := reqctx.RequestID(ctx); rid != "" {
 		req.Header.Set("x-request-id", rid)
@@ -246,14 +287,14 @@ func (c *Client) post(ctx context.Context, body []byte, stream bool) (*http.Resp
 		} else {
 			status = strconv.Itoa(resp.StatusCode)
 		}
-		c.metrics.BifrostRequests.Add(ctx, 1, observability.Attr("status", status))
+		c.metrics.UpstreamRequests.Add(ctx, 1, observability.Attr("status", status))
 	}
 	if err != nil {
 		// Network-layer error: classify into retryable vs not.
 		return nil, classifyTransportError(err)
 	}
 	if c.metrics != nil {
-		c.metrics.BifrostDurationMS.Record(ctx, time.Since(start).Milliseconds())
+		c.metrics.UpstreamDurationMS.Record(ctx, time.Since(start).Milliseconds())
 	}
 	return resp, nil
 }

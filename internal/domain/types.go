@@ -122,7 +122,7 @@ const (
 	CallCancelled = "cancelled"
 )
 
-// TokenUsage is the canonical usage shape with Bifrost cost fields for
+// TokenUsage is the canonical usage shape with upstream cost fields for
 // billing. Input/Output/Total are the NORMALIZED values (the quota currency,
 // derived via the model's token_normalization rule); Raw* preserve the
 // provider-reported numbers so per-row accounting stays reconstructible for
@@ -324,6 +324,12 @@ var (
 	ErrNotFound = func(what string) *Error {
 		return &Error{Code: "NOT_FOUND", Message: "The requested " + what + " was not found.", HTTP: http.StatusNotFound}
 	}
+
+	// ErrMethodNotAllowed — 405 + Allow (audit L1): the custom 404 wrapper
+	// used to swallow Go's built-in method-mismatch answer.
+	ErrMethodNotAllowed = func(allow string) *Error {
+		return &Error{Code: "METHOD_NOT_ALLOWED", Message: "The HTTP method is not allowed for this route.", HTTP: http.StatusMethodNotAllowed, Details: map[string]any{"allow": allow}}
+	}
 	ErrValidation = func(msg string) *Error {
 		return &Error{Code: "INVALID_REQUEST", Message: msg, HTTP: http.StatusBadRequest}
 	}
@@ -341,6 +347,12 @@ var (
 	}
 	ErrConcurrencyLimited = func(scope string) *Error {
 		return &Error{Code: "CONCURRENCY_LIMIT", Message: "Too many concurrent requests.", HTTP: http.StatusTooManyRequests, Details: map[string]any{"scope": scope}}
+	}
+	// ErrServerShuttingDown: the deployment is draining (SIGTERM). 503 so
+	// OpenAI-compatible clients apply their standard retry-with-backoff
+	// instead of treating the answer as a hard failure (audit M9).
+	ErrServerShuttingDown = func() *Error {
+		return &Error{Code: "SERVER_SHUTDOWN", Message: "The server is shutting down for maintenance; please retry shortly.", HTTP: http.StatusServiceUnavailable}
 	}
 	// OAuth & web-to-desktop handshake. OAUTH_STATE_INVALID and
 	// INVALID_OR_EXPIRED_CODE are deliberately generic (expired, replayed

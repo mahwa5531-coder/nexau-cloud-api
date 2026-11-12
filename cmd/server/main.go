@@ -1,14 +1,14 @@
 // Command server runs the MASh Cloud API: the thin cloud layer between the
-// MASh desktop runtime and the Bifrost LLM gateway.
+// MASh desktop runtime and OpenRouter (the direct LLM upstream).
 //
 // Responsibilities (and nothing else): Google-OAuth identity, subscriptions
 // and quotas, credit top-ups (Razorpay), and the LLM tunnel
-// (POST /v1/chat/completions → Bifrost, SSE). The agent runtime — sessions,
+// (POST /v1/chat/completions → OpenRouter, SSE). The agent runtime — sessions,
 // transcripts, tools, files, execution — lives entirely on the desktop.
 //
 // Boot order (fail fast, in dependency order): config → observability →
 // PostgreSQL (migrations) → Redis → auth → rate limiting → metering →
-// Bifrost client → LLM proxy → payments → HTTP.
+// OpenRouter client → LLM proxy → payments → HTTP.
 //
 // Shutdown order: stop accepting → drain the usage metering queue → flush
 // telemetry → close Redis → close PostgreSQL → exit.
@@ -25,12 +25,13 @@ import (
 
 	"github.com/mash-cloud/mash-api/internal/api"
 	"github.com/mash-cloud/mash-api/internal/auth"
-	"github.com/mash-cloud/mash-api/internal/bifrost"
 	"github.com/mash-cloud/mash-api/internal/config"
+	"github.com/mash-cloud/mash-api/internal/domain"
 	"github.com/mash-cloud/mash-api/internal/llm"
 	"github.com/mash-cloud/mash-api/internal/metering"
 	"github.com/mash-cloud/mash-api/internal/middleware"
 	"github.com/mash-cloud/mash-api/internal/observability"
+	"github.com/mash-cloud/mash-api/internal/openrouter"
 	"github.com/mash-cloud/mash-api/internal/payment"
 	"github.com/mash-cloud/mash-api/internal/payment/phonepe"
 	"github.com/mash-cloud/mash-api/internal/payment/razorpay"
@@ -71,7 +72,7 @@ func run() error {
 		return err
 	}
 	logger.Info("mash-cloud-api starting",
-		"addr", cfg.HTTPAddr, "bifrost", cfg.Bifrost.BaseURL)
+		"addr", cfg.HTTPAddr, "upstream", cfg.OpenRouter.BaseURL)
 
 	// Google-only posture guard: without Google OAuth configured, no client
 	// can ever obtain a token. That is almost certainly a misconfiguration —
@@ -170,7 +171,6 @@ func run() error {
 		RefreshRepo: refresh, Redis: rd.Client,
 		Signer:    signer,
 		AccessTTL: cfg.Auth.AccessTokenTTL, RefreshTTL: cfg.Auth.RefreshTokenTTL,
-		DeviceTTL:       cfg.Auth.DeviceTokenTTL,
 		RevocationCheck: cfg.Auth.RevocationCheck,
 
 		Google:         google,
@@ -190,34 +190,48 @@ func run() error {
 	limiter := ratelimit.New(rd.Client, cfg.Rate.FailOpen, metrics)
 
 	// 8. Metering (async, bounded, exactly-once via llm_calls.call_id).
+	// The outbox makes failed writes durable (audit H3); AfterPersist
+	// releases each call's quota reservation once its row truly lands
+	// (audit H2) — the closure runs on the batcher goroutine, well after
+	// proxy is assigned below.
+	var proxy *llm.Proxy
 	meter := metering.New(calls, metering.Config{
 		QueueSize: cfg.Meter.QueueSize, BatchSize: cfg.Meter.BatchSize,
 		FlushInterval: cfg.Meter.FlushInterval, RetryMax: cfg.Meter.RetryMax,
+		SpillPath: cfg.Meter.SpillPath,
+		AfterPersist: func(rec domain.LLMCall, durable bool) {
+			if proxy != nil {
+				proxy.QuotaPersisted(rec.TenantID, rec.CallID, durable)
+			}
+		},
 	}, metrics)
 
-	// 9. Bifrost client (shared transport, cloud-side credential only).
-	bf := bifrost.NewClient(bifrost.TransportConfig{
-		BaseURL: cfg.Bifrost.BaseURL, APIKey: cfg.Bifrost.APIKey,
-		DialTimeout: cfg.BifrostDialTimeout, TLSTimeout: cfg.BifrostTLSTimeout,
-		ResponseHeaderTO: cfg.BifrostHeaderTO, IdleConnTimeout: cfg.Bifrost.IdleConnTimeout,
-		MaxIdleConns: cfg.Bifrost.MaxIdleConns, MaxIdleConnsPerHost: cfg.Bifrost.MaxIdleConnsPerHost,
-		MaxConnsPerHost: cfg.Bifrost.MaxConnsPerHost, DisableHTTP2: cfg.Bifrost.DisableHTTP2,
-		MaxRetries:      cfg.Bifrost.MaxRetries,
-		RetryMinBackoff: cfg.Bifrost.RetryMinBackoff, RetryMaxBackoff: cfg.Bifrost.RetryMaxBackoff,
-		CircuitBreaker: bifrost.CircuitBreakerConfig{
-			Enabled: cfg.Bifrost.CBEnabled, ConsecutiveFailures: cfg.Bifrost.CBConsecutive,
-			WindowSize: cfg.Bifrost.CBWindow, MinSamples: cfg.Bifrost.CBMinSamples,
-			FailureRate: cfg.Bifrost.CBFailureRate, OpenBase: cfg.Bifrost.CBOpenBase,
-			OpenMax: cfg.Bifrost.CBOpenMax, HalfOpenProbes: cfg.Bifrost.CBHalfOpenProbes,
+	// 9. OpenRouter client — direct upstream, shared transport, cloud-side
+	// credential only (provider keys live in the OpenRouter account as BYOK).
+	or := openrouter.NewClient(openrouter.TransportConfig{
+		BaseURL: cfg.OpenRouter.BaseURL, APIKey: cfg.OpenRouter.APIKey,
+		Referer: cfg.OpenRouter.Referer, Title: cfg.OpenRouter.Title,
+		HealthURL:   cfg.OpenRouter.HealthURL,
+		DialTimeout: cfg.UpstreamDialTimeout, TLSTimeout: cfg.UpstreamTLSTimeout,
+		ResponseHeaderTO: cfg.UpstreamHeaderTO, IdleConnTimeout: cfg.OpenRouter.IdleConnTimeout,
+		MaxIdleConns: cfg.OpenRouter.MaxIdleConns, MaxIdleConnsPerHost: cfg.OpenRouter.MaxIdleConnsPerHost,
+		MaxConnsPerHost: cfg.OpenRouter.MaxConnsPerHost, DisableHTTP2: cfg.OpenRouter.DisableHTTP2,
+		MaxRetries:      cfg.OpenRouter.MaxRetries,
+		RetryMinBackoff: cfg.OpenRouter.RetryMinBackoff, RetryMaxBackoff: cfg.OpenRouter.RetryMaxBackoff,
+		CircuitBreaker: openrouter.CircuitBreakerConfig{
+			Enabled: cfg.OpenRouter.CBEnabled, ConsecutiveFailures: cfg.OpenRouter.CBConsecutive,
+			WindowSize: cfg.OpenRouter.CBWindow, MinSamples: cfg.OpenRouter.CBMinSamples,
+			FailureRate: cfg.OpenRouter.CBFailureRate, OpenBase: cfg.OpenRouter.CBOpenBase,
+			OpenMax: cfg.OpenRouter.CBOpenMax, HalfOpenProbes: cfg.OpenRouter.CBHalfOpenProbes,
 		},
 	}, metrics)
 
 	// 10. The LLM proxy (the tunnel service behind POST /v1/chat/completions).
 	//      Token accounting weights come from the token_normalization table
 	//      (hot-changeable via SQL; docs/TABLES.md) through a short-TTL cache.
-	proxy := &llm.Proxy{
-		Bifrost: bf, Meter: meter, Limiter: limiter, Usage: calls, Metrics: metrics,
-		Norm: llm.NewRuleCache(repos.NewNormalization(pg.Pool), cfg.NormCacheTTL),
+	proxy = &llm.Proxy{
+		Upstream: or, Meter: meter, Limiter: limiter, Usage: calls, Metrics: metrics,
+		Norm:  llm.NewRuleCache(repos.NewNormalization(pg.Pool), cfg.NormCacheTTL),
 		Redis: rd.Client, UsageCacheTTL: 5 * time.Second,
 		Limits: llm.Limits{
 			MaxMessages: cfg.MaxMessages, MaxTools: cfg.MaxTools, MaxModelLen: cfg.MaxModelLen,
@@ -228,9 +242,10 @@ func run() error {
 		},
 		Timing: llm.Timing{
 			IdleTimeout: cfg.StreamIdleTimeout, MaxDuration: cfg.StreamMaxDuration,
-			NonStreamTimeout: cfg.BifrostReqTimeout,
+			NonStreamTimeout: cfg.UpstreamReqTimeout,
 		},
-		SlotTTL: cfg.Rate.SlotTimeout,
+		SlotTTL:    cfg.Rate.SlotTimeout,
+		ReserveTTL: cfg.QuotaReserveTTL,
 	}
 
 	// 11. Payments (plan purchases — plans only; docs/PAYMENT-GATEWAY.md).
@@ -261,24 +276,34 @@ func run() error {
 			BaseURL: cfg.Payments.PhonepeAPIBase,
 		})
 	case "mock":
+		// Belt-and-braces (audit M13): config validation already
+		// refuses provider=mock without the explicit dev opt-in;
+		// this second guard keeps a future wiring change from
+		// silently reintroducing the hole.
+		if !cfg.Payments.AllowMock {
+			return errors.New("payments: NEXAU_PAYMENT_PROVIDER=mock requires NEXAU_PAYMENT_ALLOW_MOCK=true")
+		}
 		mock := payment.NewMockProvider()
 		mock.AutoCapture = cfg.Payments.MockAutoCapture
 		payProvider = mock
 	}
+	var payStore *repos.PaymentsRepo
 	if payProvider != nil {
 		payCatalog, err := payment.CatalogFromEnv(cfg.Payments.CatalogJSON)
 		if err != nil {
 			return err
 		}
-		payStore := repos.NewPayments(pg.Pool)
+		payStore = repos.NewPayments(pg.Pool)
 		paySvc = payment.New(payment.Config{
 			Store: payStore, Provider: payProvider, Catalog: payCatalog,
 			Limiter:  limiter,
 			OrderTTL: cfg.Payments.OrderTTL, SweepInterval: cfg.Payments.SweepInterval,
-			HistoryLimit:    cfg.Payments.HistoryLimit,
-			CheckoutPerUser: cfg.Payments.CheckoutPerUser,
-			WebhookPerIP:    cfg.Payments.WebhookPerIP,
-			Metrics:         metrics,
+			LateCaptureWindow:  cfg.Payments.LateCaptureWindow,
+			ReconcilePerTenant: cfg.Payments.ReconcilePerMinute,
+			HistoryLimit:       cfg.Payments.HistoryLimit,
+			CheckoutPerUser:    cfg.Payments.CheckoutPerUser,
+			WebhookPerIP:       cfg.Payments.WebhookPerIP,
+			Metrics:            metrics,
 		})
 		paySvc.StartSweeper(rootCtx) // stops with rootCtx at shutdown
 		logger.Info("payments enabled", "provider", cfg.Payments.Provider,
@@ -286,7 +311,7 @@ func run() error {
 	}
 
 	// 12. HTTP surface.
-	apiHandler := api.New(cfg, authSvc, authMW, proxy, calls, pg, rd, bf, limiter, metrics, otel, paySvc)
+	apiHandler := api.New(cfg, authSvc, authMW, proxy, calls, pg, rd, or, limiter, metrics, otel, paySvc)
 
 	chain := middleware.Chain(middleware.Options{
 		MaxBodyBytes: cfg.MaxBodyBytes, MaxInFlight: cfg.MaxConcurrentReqs,
@@ -305,8 +330,12 @@ func run() error {
 	// 13. Background housekeeping + metrics sampler.
 	hk := startHousekeeping(rootCtx, housekeepingDeps{
 		refresh: refresh,
+		calls:   calls,
+		paymnts: payStore,
 		pg:      pg, metrics: metrics,
-		proxy: proxy,
+		proxy:                proxy,
+		usageRetentionDays:   cfg.Payments.UsageRetentionDays,
+		webhookRetentionDays: cfg.Payments.WebhookRetentionDays,
 	}, logger)
 	defer hk.stop()
 
@@ -331,6 +360,14 @@ func run() error {
 		// Stop background work (housekeeping sweeps, samplers) NOW so the
 		// deferred hk.stop() cannot add its own unbounded tail.
 		rootCancel()
+		// End in-flight LLM streams GRACEFULLY before draining
+		// connections (audit M9): each stream emits an in-band
+		// OpenAI-style error event + a clean [DONE], and new admissions
+		// are refused with a retryable 503. Without this, streams up
+		// to StreamMaxDuration (15m) were severed by a bare TCP close
+		// when the 30s grace expired — every deploy corrupted the
+		// longest agent runs and triggered blind client retries.
+		proxy.BeginShutdown()
 	}
 
 	// Grace sequence: ONE total budget (NEXAU_SHUTDOWN_GRACE); every step

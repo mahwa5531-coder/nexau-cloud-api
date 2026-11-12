@@ -22,11 +22,20 @@ type Config struct {
 	Catalog  *Catalog
 	Limiter  Admitter // nil = no checkout/webhook budgets (tests)
 
-	OrderTTL        time.Duration // pending order lifetime (sweeper expiry)
-	SweepInterval   time.Duration // background sweeper cadence
-	HistoryLimit    int           // default/cap for history pages
-	CheckoutPerUser int           // checkout requests / user / hour (0 = off)
-	WebhookPerIP    int           // webhook posts / IP / minute (0 = off)
+	OrderTTL      time.Duration // pending order lifetime (sweeper expiry)
+	SweepInterval time.Duration // background sweeper cadence
+	// LateCaptureWindow bounds how long an EXPIRED order keeps being
+	// re-checked against the provider (audit H5): settlements can land
+	// after our TTL. Default 24h.
+	LateCaptureWindow time.Duration
+	HistoryLimit      int // default/cap for history pages
+	CheckoutPerUser   int // checkout requests / user / hour (0 = off)
+	WebhookPerIP      int // webhook posts / IP / minute (0 = off)
+	// ReconcilePerTenant bounds provider fetches triggered by client reads
+	// (confirm/status read-through) per tenant per minute (audit H6: an
+	// authenticated free account polling order status used to fan out to the
+	// metered provider API without limit). 0 = off. Default 30.
+	ReconcilePerTenant int
 
 	Metrics *observability.Metrics
 }
@@ -50,6 +59,12 @@ func New(cfg Config) *Service {
 	}
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = time.Minute
+	}
+	if cfg.LateCaptureWindow <= 0 {
+		cfg.LateCaptureWindow = 24 * time.Hour
+	}
+	if cfg.ReconcilePerTenant == 0 {
+		cfg.ReconcilePerTenant = 30
 	}
 	if cfg.HistoryLimit <= 0 {
 		cfg.HistoryLimit = 50

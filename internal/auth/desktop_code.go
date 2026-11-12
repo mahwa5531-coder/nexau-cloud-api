@@ -76,9 +76,9 @@ func (s *Service) ExchangeDesktopCode(ctx context.Context, rawCode, deviceID, de
 	if name == "" {
 		name = "unknown device"
 	}
-	if len(name) > 128 {
-		name = name[:128]
-	}
+	// Rune-safe truncation (audit M4): device names are user-supplied and
+	// multi-byte names must not be split at the column boundary.
+	name = truncateUTF8(name, 128)
 	plat := strings.ToLower(strings.TrimSpace(platform))
 	if !platformWhitelist[plat] {
 		return nil, domain.ErrValidation("platform must be one of windows|macos|linux|android|ios|web|other")

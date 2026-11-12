@@ -27,7 +27,7 @@
 | **Frontier alternate** | Google **Gemini 4 Argon** | $2 / $10 (promo; 95% cache discount) | Leads 13/19 agentic benchmarks Google published vs GPT-6; the cache discount is ideal for re-reading the same workpapers. Promo price — re-price when it flips. |
 | **Frontier alternate** | OpenAI **GPT-6.1 Sol** | $2 / $10 (promo thru 2026-11-21, then $4/$20) | Top-3 SWE-bench Verified (96%+ with the mini-agent harness). Strong at structured extraction + code. Promo ends soon — Sonnet 5.5 is the safer default. |
 | **Ultra (optional unlock)** | Anthropic **Claude Opus 5.5** | ~$20 / ~$100 / ~$2 | The hardest judgment calls only. Metered at 200× weight so nobody drains the platform by accident. |
-| **Coding specialist (optional, self-hosted route only)** | **Qwen3-Coder-480B** (Apache-2.0) | ≈$0.30–0.60 hosted | 69.6% SWE-bench Verified — best open-weights coder. For confidential data, serve via zero-retention hosting (DeepInfra/Bedrock/self-host) behind Bifrost — **never** the direct vendor API (§3). |
+| **Coding specialist (optional, self-hosted route only)** | **Qwen3-Coder-480B** (Apache-2.0) | ≈$0.30–0.60 hosted | 69.6% SWE-bench Verified — best open-weights coder. For confidential data, serve via zero-retention hosting (DeepInfra/Bedrock/self-host) registered as a BYOK key on OpenRouter — **never** the direct vendor API (§3). |
 
 **Why Claude Sonnet 5.5 is THE audit pick.** Audit-agent work is
 tool-calling-heavy (fetch ledger page → reconcile → write working paper →
@@ -80,7 +80,7 @@ Seeded rows (000011):
 
 Hot-change: `UPDATE token_normalization SET output_weight = … WHERE model = …`
 — picked up within `NEXAU_NORM_CACHE_TTL` (~30s), no restart, no redeploy.
-**Operator rule: every model you enable in Bifrost gets a row here.** An
+**Operator rule: every model you enable on OpenRouter gets a row here.** An
 unlisted model falls to the `*` default (1:1:1) and is effectively
 under-metered — fine for cheap models, wrong for expensive ones.
 
@@ -119,8 +119,9 @@ in the schema, not just the marketing.
 **Launch posture:** all three primary providers are no-training-by-default
 with ZDR available. The optional Qwen3-Coder route must go through a
 zero-retention host (DeepInfra's zero-retention policy, AWS Bedrock, or
-self-hosted vLLM) behind Bifrost — Bifrost's provider config makes this a
-routing decision, invisible to the desktop client.
+self-hosted vLLM) registered as a BYOK key on OpenRouter — provider routing
+stays a routing decision (`provider.only`/`order` per request or per account),
+invisible to the desktop client.
 
 **Indian compliance context:** as a platform processing client financial
 data for CA firms, we are a *data processor* under the **DPDP Act 2023** —
@@ -155,7 +156,7 @@ Two currencies, one enforcement path:
 | `window_5h_tokens` | **60,000** | ≈ ₹0.60 upstream cost per 5h worst case. Enough for 3–4 Luna agent sessions — a real taste of the product, not a demo toy. |
 | `window_weekly_tokens` | **250,000** | ≈ ₹2.40/week → **cost cap ~₹10/month per free firm**. CAC-safe at any scale. |
 | Models | **GPT-6 Luna + Gemini 3.8 Flash only** (enforced by the 000011 allowlist) | Frontier on free = margin death; cheap-and-good on free = the upgrade itch. |
-| RPM / concurrent | 20 / 3 | Interactive use, not batch farming. |
+| RPM / concurrent | 20 / 8 | Interactive use, not batch farming. 8 slots cover 1–5 parallel agent tasks with subagent fan-out headroom (migration 0015); the RPM window stays the binding throttle. |
 
 Free-tier abuse ceiling: ₹10/month per firm — a rounding error, so no
 anti-abuse heroics needed at launch.
@@ -203,22 +204,26 @@ their normalized weights change (SQL), not the user-facing price.
 
 ---
 
-## 6. Bifrost wiring (what connects where)
+## 6. OpenRouter wiring (what connects where)
 
 ```
-NEXAU_BIFROST_URL=http://bifrost:8080
-NEXAU_BIFROST_API_KEY=<one cloud-held key>
+NEXAU_OPENROUTER_URL=https://openrouter.ai/api     # default; rarely set
+NEXAU_OPENROUTER_API_KEY=<one cloud-held OpenRouter key>
 
-# compose.yaml bifrost service (already wired):
-BIFROST_PROVIDER_KEYS_OPENAI=...      # Luna + Sol
-BIFROST_PROVIDER_KEYS_ANTHROPIC=...   # Sonnet/Opus 5.5
-BIFROST_PROVIDER_KEYS_GOOGLE=...      # Flash + Argon
+# In the OpenRouter account (dashboard, NOT env vars):
+#   - register provider keys as BYOK: OpenAI (Luna + Sol), Anthropic
+#     (Sonnet/Opus 5.5), Google (Flash + Argon)
+#   - on each BYOK key set "Never use shared capacity" so requests are
+#     NEVER served by OpenRouter's own (metered) shared endpoints
+#   - BYOK inference is free up to $25k/month list-price usage (5% of list
+#     price beyond) — at our scale the fee is $0
 ```
 
 Model ids the desktop requests: `openai/gpt-6-luna`,
 `google/gemini-3.8-flash`, `anthropic/claude-sonnet-5.5`,
-`google/gemini-4-argon`, `openai/gpt-6.1-sol`. Keep the normalization table
-in sync with whatever ids your Bifrost build exposes (§2 operator rule).
+`google/gemini-4-argon`, `openai/gpt-6.1-sol` — these are native OpenRouter
+slugs (`vendor/model`). Keep the normalization table in sync with the slugs
+the account serves (§2 operator rule).
 
 ---
 
@@ -226,7 +231,7 @@ in sync with whatever ids your Bifrost build exposes (§2 operator rule).
 
 1. `NEXAU_PAYMENT_PROVIDER=phonepe` + merchant trio + redirect/callback URLs
    (docs/PAYMENT-GATEWAY.md §11) — payments ON.
-2. Bifrost provider keys for the three launch providers (§6).
+2. OpenRouter BYOK provider keys for the three launch providers, shared-capacity fallback OFF (§6).
 3. File Google's paid-tier ZDR request (one-time form).
 4. Pro billing is self-serve: the Pro SKUs (`plan_pro_1m`, `plan_pro_1y`)
    ARE the checkout catalog — a firm pays, the subscription activates

@@ -81,6 +81,7 @@ func (v *keyFuncVerifier) Verify(ctx context.Context, token string) (*Claims, er
 		TenantID string `json:"tid"`
 		Role     string `json:"rol"`
 		DeviceID string `json:"dev"`
+		Scope    string `json:"scp"`
 	}
 	if _, _, err := jwt.NewParser().ParseUnverified(token, &body); err != nil {
 		return nil, ErrTokenClass{Kind: "malformed", Desc: "unparseable claims"}
@@ -97,6 +98,7 @@ func (v *keyFuncVerifier) Verify(ctx context.Context, token string) (*Claims, er
 		IssuedAt:  body.IssuedAt.Time,
 		ExpiresAt: body.ExpiresAt.Time,
 		Method:    "local",
+		Scope:     body.Scope,
 	}
 	if c.Subject == "" {
 		return nil, ErrTokenClass{Kind: "malformed", Desc: "missing sub claim"}
@@ -136,6 +138,18 @@ func (s *LocalSigner) Sign(subject, tenantID, role, deviceID, jti string, now ti
 // uses it for short-lived (minutes) browser tokens that carry no refresh
 // token; everything else goes through Sign.
 func (s *LocalSigner) SignWithTTL(subject, tenantID, role, deviceID, jti string, now time.Time, ttl time.Duration) (string, error) {
+	return s.signScoped(subject, tenantID, role, deviceID, jti, now, ttl, "api")
+}
+
+// SignWeb mints a WEB-session token (audit M3): same cryptographic shape,
+// scope "web". Web tokens deliberately cannot reach the LLM tunnel, usage
+// aggregation or device-pairing routes — a browser-session theft must not be
+// a full API credential. Middleware.RequireDevice enforces the boundary.
+func (s *LocalSigner) SignWeb(subject, tenantID, role, jti string, now time.Time, ttl time.Duration) (string, error) {
+	return s.signScoped(subject, tenantID, role, "", jti, now, ttl, "web")
+}
+
+func (s *LocalSigner) signScoped(subject, tenantID, role, deviceID, jti string, now time.Time, ttl time.Duration, scope string) (string, error) {
 	claims := jwt.MapClaims{
 		"iss": s.issuer,
 		"aud": s.audience,
@@ -145,6 +159,7 @@ func (s *LocalSigner) SignWithTTL(subject, tenantID, role, deviceID, jti string,
 		"jti": jti,
 		"tid": tenantID,
 		"rol": role,
+		"scp": scope,
 	}
 	if deviceID != "" {
 		claims["dev"] = deviceID

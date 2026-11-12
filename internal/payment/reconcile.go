@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -29,6 +30,16 @@ func (s *Service) GetOrder(ctx context.Context, tenantID, orderID string) (*Orde
 	if !s.Enabled() {
 		return nil, ErrDisabled
 	}
+	// Bounded provider fan-out (audit H6): the read-through reconcile is the
+	// expensive part of this endpoint (one METERED provider API call). A
+	// per-tenant minute budget keeps a polling loop — authenticated, free
+	// account or stolen token — from turning reads into a provider bill.
+	// Over budget: serve the stored order; the next window reconciles.
+	reconcileOK := true
+	if s.lim != nil && s.cfg.ReconcilePerTenant > 0 {
+		reconcileOK = s.lim.Admit(ctx, "pay:reconcile:"+tenantID, time.Minute,
+			s.cfg.ReconcilePerTenant, fmt.Sprintf("rc-%d", time.Now().UnixNano()))
+	}
 	o, err := s.store.OrderByID(ctx, orderID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -39,11 +50,21 @@ func (s *Service) GetOrder(ctx context.Context, tenantID, orderID string) (*Orde
 	if o.TenantID != tenantID {
 		return nil, ErrOrderNotFound()
 	}
-	if o.Status == StatusPending || o.Status == StatusAttempted {
+	if reconcileOK && (o.Status == StatusPending || o.Status == StatusAttempted) {
 		if synced, err := s.syncOrder(ctx, o); err == nil {
 			return synced, nil
 		}
 		// fall through: serve the stored (possibly stale) order
+	}
+	// Recently-EXPIRED orders also reconcile (audit H5): a settlement that
+	// landed after our TTL is real money — a polling client converges the
+	// view immediately instead of waiting for the sweeper's late-capture
+	// pass. Bounded to the late-capture window so the read-through cannot
+	// fan out to the provider forever.
+	if reconcileOK && o.Status == StatusExpired && time.Since(o.ExpiresAt) <= s.cfg.LateCaptureWindow {
+		if synced, err := s.syncOrder(ctx, o); err == nil {
+			return synced, nil
+		}
 	}
 	return o, nil
 }
@@ -65,13 +86,28 @@ func (s *Service) syncOrder(ctx context.Context, o *Order) (*Order, error) {
 		// semantics in ApplyPaid) — a missing payment id must never block
 		// crediting.
 		payID := ""
+		amountMatched := false
+		paysFetched := false
 		if pays, err := s.provider.FetchOrderPayments(ctx, o.ProviderOrderID); err == nil {
+			paysFetched = true
 			for _, p := range pays {
 				if NormalizePaymentStatus(p.Status) == StatusPaid && p.AmountPaise == o.AmountPaise {
 					payID = p.ID
+					amountMatched = true
 					break
 				}
 			}
+		}
+		// Audit M11 — the amount cross-check the webhook and confirm doors
+		// already enforce, hoisted onto the third door. When the payments list
+		// WAS fetched and no captured payment matches the order amount, this
+		// is a tamper/provider-bug signal: never activate. (When the list
+		// could not be fetched at all we keep the legacy behaviour — the order
+		// row is ours and the provider says paid; blocking crediting on a
+		// broken list endpoint would lose payments the other way.)
+		if paysFetched && !amountMatched {
+			s.count("reconcile_amount_mismatch", o.Status)
+			return o, nil // stored state served; ops alarm via metric
 		}
 		if _, err := s.applyPaid(ctx, o.ID, payID); err != nil {
 			return nil, err
@@ -131,6 +167,23 @@ func (s *Service) sweepOnce(ctx context.Context) {
 			}
 			// Errors swallowed deliberately: one bad order (provider 404
 			// for a hand-deleted test order, etc.) must not block the rest.
+			_, _ = s.syncOrder(sweepCtx, o)
+		}
+	}
+
+	// Late-capture recovery (audit H5): orders that expired while a
+	// settlement was still in flight (webhook outage + browser crash is the
+	// classic case) used to sit in 'expired' forever — captured money, no
+	// plan, discovery via support ticket. For a bounded window after expiry
+	// they keep being re-checked; syncOrder applies provider truth through
+	// the same exactly-once core, and ApplyPaid's state guard
+	// (status <> 'paid') lets an expired row still transition — paid beats
+	// expired, exactly as the design promises.
+	if expired, err := s.store.ListRecentlyExpired(sweepCtx, s.cfg.LateCaptureWindow, maxSyncPerSweep); err == nil {
+		for _, o := range expired {
+			if err := sweepCtx.Err(); err != nil {
+				return
+			}
 			_, _ = s.syncOrder(sweepCtx, o)
 		}
 	}

@@ -27,6 +27,9 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -93,28 +96,46 @@ func NewGoogleProvider(clientID, clientSecret, redirectURI, authURL, tokenURL, j
 }
 
 // AuthCodeURL renders the consent-screen redirect (top-level navigation).
-func (g *GoogleProvider) AuthCodeURL(state string) string {
+// PKCE (RFC 7636, S256) and an OIDC nonce are always sent (audit M1): the
+// authorization code alone is then not a bearer credential — redeeming it
+// also requires the server-held code_verifier, and the returned ID token
+// must carry the nonce bound to this login attempt (replay defense).
+func (g *GoogleProvider) AuthCodeURL(state, codeChallenge, nonce string) string {
 	q := url.Values{}
 	q.Set("client_id", g.clientID)
 	q.Set("redirect_uri", g.redirectURI)
 	q.Set("response_type", "code")
 	q.Set("scope", "openid email profile")
 	q.Set("state", state)
+	q.Set("code_challenge", codeChallenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("nonce", nonce)
 	q.Set("access_type", "online")
 	q.Set("prompt", "select_account")
 	return g.authURL + "?" + q.Encode()
 }
 
+// S256CodeChallenge derives the PKCE code challenge (base64url, no padding).
+func S256CodeChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 // Exchange trades the authorization code at Google's token endpoint and
 // verifies the returned ID token. Only the ID token is trusted (it is
 // delivered over our own TLS connection; the access_token is ignored).
-func (g *GoogleProvider) Exchange(ctx context.Context, code string) (*GoogleIdentity, error) {
+func (g *GoogleProvider) Exchange(ctx context.Context, code, codeVerifier, nonce string) (*GoogleIdentity, error) {
 	form := url.Values{}
 	form.Set("code", code)
 	form.Set("client_id", g.clientID)
 	form.Set("client_secret", g.clientSecret)
 	form.Set("redirect_uri", g.redirectURI)
 	form.Set("grant_type", "authorization_code")
+	if codeVerifier != "" {
+		// PKCE proof-of-possession (audit M1): without the verifier that only
+		// this server holds, a stolen authorization code is unusable.
+		form.Set("code_verifier", codeVerifier)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -140,7 +161,7 @@ func (g *GoogleProvider) Exchange(ctx context.Context, code string) (*GoogleIden
 	if tok.IDToken == "" {
 		return nil, domain.ErrOAuthProvider(errors.New("token endpoint returned no id_token"))
 	}
-	return g.verifyIDToken(ctx, tok.IDToken)
+	return g.verifyIDToken(ctx, tok.IDToken, nonce)
 }
 
 // googleIssuers are both accepted forms (Google documents both).
@@ -151,13 +172,14 @@ var googleIssuers = map[string]bool{
 
 // verifyIDToken checks RS256 signature against Google's JWKS and validates
 // iss / aud / exp; then extracts the identity claims.
-func (g *GoogleProvider) verifyIDToken(ctx context.Context, raw string) (*GoogleIdentity, error) {
+func (g *GoogleProvider) verifyIDToken(ctx context.Context, raw, nonce string) (*GoogleIdentity, error) {
 	var body struct {
 		jwt.RegisteredClaims
 		Email         string `json:"email"`
 		EmailVerified bool   `json:"email_verified"`
 		Name          string `json:"name"`
 		Picture       string `json:"picture"`
+		Nonce         string `json:"nonce"`
 	}
 	parsed, err := jwt.ParseWithClaims(raw, &body, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
@@ -186,6 +208,12 @@ func (g *GoogleProvider) verifyIDToken(ctx context.Context, raw string) (*Google
 	if body.Subject == "" || body.Email == "" {
 		return nil, domain.ErrOAuthProvider(errors.New("id token missing sub/email"))
 	}
+	// OIDC nonce (audit M1): when the flow sent one, the ID token must carry
+	// the SAME value — an ID token minted for a different login attempt (a
+	// replay from elsewhere) fails here even with a valid signature.
+	if nonce != "" && body.Nonce != nonce {
+		return nil, domain.ErrOAuthProvider(errors.New("id token nonce mismatch"))
+	}
 	return &GoogleIdentity{
 		Sub: body.Subject, Email: strings.ToLower(strings.TrimSpace(body.Email)),
 		EmailVerified: body.EmailVerified, Name: body.Name, Picture: body.Picture,
@@ -195,49 +223,109 @@ func (g *GoogleProvider) verifyIDToken(ctx context.Context, raw string) (*Google
 // googleKeys is a minimal JWKS cache for Google's RSA keys (mirror of
 // JWKSVerifier's key resolution, RS256-only, min-refresh throttled).
 type googleKeys struct {
-	url     string
-	hc      httpClient
-	mu      sync.RWMutex
-	keys    map[string]any
-	lastTry time.Time
+	url      string
+	hc       httpClient
+	mu       sync.RWMutex
+	keys     map[string]any
+	lastTry  time.Time
+	fetching bool
 }
 
-const googleKeysMinRefresh = time.Minute
+const (
+	googleKeysFastWindow = 2 * time.Second // unknown-kid fast-refetch floor (audit L14)
+)
 
+// key resolves one signing key. Audit L14 fixed two frictions: the HTTP
+// fetch no longer holds the write lock (a slow JWKS endpoint used to
+// serialize every login behind one network call), and an UNKNOWN kid
+// triggers a bounded immediate refetch instead of waiting out the old
+// one-minute throttle — right after the provider rotates keys, logins
+// presenting the new kid used to be refused for up to a minute.
+// A concurrent lookup that lands while a refresh is ALREADY in flight
+// JOINS it (single-flight) instead of being throttled out — without this,
+// simultaneous first logins raced: the loser read the empty cache, saw the
+// winner's just-set lastTry, and was refused for the full 2s floor.
 func (k *googleKeys) key(ctx context.Context, kid string) (any, error) {
 	k.mu.RLock()
 	key, ok := k.keys[kid]
+	lastTry := k.lastTry
+	inFlight := k.fetching
 	k.mu.RUnlock()
 	if ok {
 		return key, nil
 	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	if inFlight {
+		_ = k.waitForInFlight()
+		k.mu.RLock()
+		defer k.mu.RUnlock()
+		if key, ok := k.keys[kid]; ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("unknown kid %q (after in-flight refresh)", kid)
+	}
+	if time.Since(lastTry) < googleKeysFastWindow {
+		return nil, fmt.Errorf("unknown kid %q (refresh throttled)", kid)
+	}
+	if err := k.refresh(ctx); err != nil {
+		return nil, err
+	}
+	k.mu.RLock()
+	defer k.mu.RUnlock()
 	if key, ok := k.keys[kid]; ok {
 		return key, nil
 	}
-	if time.Since(k.lastTry) < googleKeysMinRefresh {
-		return nil, fmt.Errorf("unknown kid %q (refresh throttled)", kid)
+	return nil, fmt.Errorf("unknown kid %q", kid)
+}
+
+// waitForInFlight blocks (bounded, ~1s) until a concurrently running
+// refresh finishes. Shared by key() joiners and refresh()'s own late
+// arrivals.
+func (k *googleKeys) waitForInFlight() bool {
+	for i := 0; i < 50; i++ {
+		time.Sleep(20 * time.Millisecond)
+		k.mu.RLock()
+		done := !k.fetching
+		k.mu.RUnlock()
+		if done {
+			return true
+		}
 	}
+	return false
+}
+
+// refresh performs one JWKS fetch and swaps the key set atomically. Only
+// one refresh runs at a time (single-flight via the fetching flag); the
+// lock is NEVER held across the HTTP call. Late arrivals join via
+// waitForInFlight.
+func (k *googleKeys) refresh(ctx context.Context) error {
+	k.mu.Lock()
+	if k.fetching {
+		k.mu.Unlock()
+		k.waitForInFlight()
+		return nil
+	}
+	k.fetching = true
 	k.lastTry = time.Now()
+	k.mu.Unlock()
+	defer func() { k.mu.Lock(); k.fetching = false; k.mu.Unlock() }()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	resp, err := k.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("jwks fetch: %w", err)
+		return fmt.Errorf("jwks fetch: %w", err)
 	}
 	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)); _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("jwks fetch: status %d", resp.StatusCode)
+		return fmt.Errorf("jwks fetch: status %d", resp.StatusCode)
 	}
 	var set struct {
 		Keys []jwk `json:"keys"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&set); err != nil {
-		return nil, fmt.Errorf("jwks decode: %w", err)
+		return fmt.Errorf("jwks decode: %w", err)
 	}
 	next := make(map[string]any, len(set.Keys))
 	for _, j := range set.Keys {
@@ -249,20 +337,22 @@ func (k *googleKeys) key(ctx context.Context, kid string) (any, error) {
 			next[j.Kid] = pub
 		}
 	}
+	k.mu.Lock()
 	k.keys = next
-	if key, ok := k.keys[kid]; ok {
-		return key, nil
-	}
-	return nil, fmt.Errorf("unknown kid %q", kid)
+	k.mu.Unlock()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
 // Service methods: state, web grant, lookup
 // ---------------------------------------------------------------------------
 
-// oauthTx is the Redis-stored state record (bound to the tx cookie).
+// oauthTx is the Redis-stored state record (bound to the tx cookie). It also
+// carries the PKCE verifier and OIDC nonce for the login it started (M1).
 type oauthTx struct {
 	Tx        string `json:"tx"`
+	Verifier  string `json:"verifier"`
+	Nonce     string `json:"nonce"`
 	CreatedAt int64  `json:"created_at"`
 }
 
@@ -290,11 +380,14 @@ func (s *Service) BeginGoogleOAuth(ctx context.Context) (redirectURL, state, tx 
 	}
 	state = randomHex(32)
 	tx = randomHex(32)
-	rec, _ := json.Marshal(oauthTx{Tx: tx, CreatedAt: time.Now().Unix()})
+	// PKCE verifier (server-held) + OIDC nonce (audit M1).
+	verifier := randomHex(32) // 64 hex chars — valid RFC 7636 verifier charset
+	nonce := randomHex(16)
+	rec, _ := json.Marshal(oauthTx{Tx: tx, Verifier: verifier, Nonce: nonce, CreatedAt: time.Now().Unix()})
 	if err := s.Redis.Set(ctx, "auth:oauth:state:"+state, rec, s.OAuthStateTTL).Err(); err != nil {
 		return "", "", "", domain.ErrDependencyUnavailable("redis")
 	}
-	return s.Google.AuthCodeURL(state), state, tx, nil
+	return s.Google.AuthCodeURL(state, S256CodeChallenge(verifier), nonce), state, tx, nil
 }
 
 // FinishGoogleOAuth consumes the state (single-use), verifies the tx cookie,
@@ -311,13 +404,16 @@ func (s *Service) FinishGoogleOAuth(ctx context.Context, code, state, txCookie s
 		return nil, "", domain.ErrOAuthState()
 	}
 	var st oauthTx
-	if err := json.Unmarshal([]byte(raw), &st); err != nil || st.Tx == "" || st.Tx != txCookie {
+	// Constant-time comparison (audit L12): the tx secret is a 256-bit
+	// bearer value; a plain == leaks how many leading bytes matched.
+	if err := json.Unmarshal([]byte(raw), &st); err != nil || st.Tx == "" ||
+		subtle.ConstantTimeCompare([]byte(st.Tx), []byte(txCookie)) != 1 {
 		// Expired/unknown/tampered state OR a tx cookie from a different flow
 		// (login-CSRF attempt) — one generic error, no oracle.
 		return nil, "", domain.ErrOAuthState()
 	}
 
-	ident, err := s.Google.Exchange(ctx, code)
+	ident, err := s.Google.Exchange(ctx, code, st.Verifier, st.Nonce)
 	if err != nil {
 		return nil, "", err
 	}
@@ -348,16 +444,13 @@ func (s *Service) FinishGoogleOAuth(ctx context.Context, code, state, txCookie s
 }
 
 // resolveGoogleUser applies the documented cases with race retries
-// (login / provision).
+// (login / provision). Profile fields are truncated on RUNE boundaries
+// (audit M4): a byte-slice at the column limit could split a multi-byte
+// character, and PostgreSQL refuses to store the invalid UTF-8 — first
+// login then answered 500 for users with long CJK/emoji names.
 func (s *Service) resolveGoogleUser(ctx context.Context, ident *GoogleIdentity) (*domain.User, error) {
-	name := ident.Name
-	if len(name) > 128 {
-		name = name[:128]
-	}
-	avatar := ident.Picture
-	if len(avatar) > 2048 {
-		avatar = avatar[:2048]
-	}
+	name := truncateUTF8(ident.Name, 128)
+	avatar := truncateUTF8(ident.Picture, 2048)
 	for attempt := 0; attempt < 3; attempt++ {
 		u, err := s.OAuth.FindOrCreateGoogleUser(ctx, ident.Sub, ident.Email, name, avatar)
 		if err == nil {
@@ -424,7 +517,7 @@ func (s *Service) ExchangeWebGrant(ctx context.Context, grant string) (*WebSessi
 	if s.Signer == nil {
 		return nil, &domain.Error{Code: "UNSUPPORTED_AUTH_MODE", Message: "This deployment mints no access tokens; use your identity provider.", HTTP: http.StatusNotImplemented}
 	}
-	access, err := s.Signer.SignWithTTL(u.ID, tenantID, role, "", ids.New("jti"), time.Now(), s.WebSessionTTL)
+	access, err := s.Signer.SignWeb(u.ID, tenantID, role, ids.New("jti"), time.Now(), s.WebSessionTTL)
 	if err != nil {
 		return nil, domain.ErrInternal(err)
 	}

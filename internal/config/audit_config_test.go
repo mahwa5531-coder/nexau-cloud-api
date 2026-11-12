@@ -17,7 +17,7 @@ func setBaseEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("NEXAU_DATABASE_URL", "postgres://u:p@localhost:5432/mash?sslmode=require")
 	t.Setenv("NEXAU_REDIS_URL", "redis://localhost:6379/0")
-	t.Setenv("NEXAU_BIFROST_URL", "http://localhost:8081")
+	t.Setenv("NEXAU_OPENROUTER_API_KEY", "sk-or-v1-testkey")
 	t.Setenv("NEXAU_AUTH_HS256_SECRET", strings.Repeat("s", 48))
 }
 

@@ -23,6 +23,18 @@ func (a *API) handleUsage(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	to := now
 	from := now.AddDate(0, 0, -30)
+	// days= is honoured when present and must be a clean integer within the
+	// 366-day cap (audit L2: garbage like days=99999 or days=abc used to be
+	// silently ignored, and a UI heading that said 'All time' happily rendered
+	// 30 days of data under it).
+	if v := r.URL.Query().Get("days"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 366 {
+			writeError(w, r, domain.ErrValidation("days must be an integer within [1,366]"))
+			return
+		}
+		from = now.AddDate(0, 0, -n)
+	}
 	if v := r.URL.Query().Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {

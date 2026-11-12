@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mash-cloud/mash-api/internal/payment"
 )
@@ -36,6 +37,13 @@ func (c *Client) ParseWebhook(body []byte) (*payment.WebhookEvent, error) {
 	}
 	if ev.ID == "" || ev.Type == "" {
 		return nil, fmt.Errorf("stripe: webhook envelope missing id/type")
+	}
+	// Audit L15: the livemode flag was parsed and ignored. A test-mode
+	// secret wired into production would have processed TEST events into
+	// REAL entitlements. The envelope's flag is authoritative: a test-mode
+	// event against live keys is refused outright.
+	if !ev.Livemode && c.live() {
+		return nil, fmt.Errorf("stripe: test-mode event delivered to a live deployment")
 	}
 
 	out := &payment.WebhookEvent{
@@ -81,4 +89,11 @@ func mapEventType(t string) string {
 func synthesizedEventID(raw []byte) string {
 	h := sha256.Sum256(raw)
 	return "evt_" + hex.EncodeToString(h[:16])
+}
+
+// live reports whether this client is configured with live-mode keys
+// (sk_live_/rk_live_). Test keys (sk_test_…) must never mint real
+// entitlements (audit L15).
+func (c *Client) live() bool {
+	return strings.HasPrefix(c.apiKey, "sk_live_") || strings.HasPrefix(c.apiKey, "rk_live_")
 }

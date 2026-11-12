@@ -27,7 +27,7 @@ fmt:
 ## lint: fmt + vet + build gate
 lint: fmt vet build
 
-## up: full local stack (postgres, redis, bifrost, api)
+## up: full local stack (postgres, redis, api)
 up:
 	docker compose up -d --build
 

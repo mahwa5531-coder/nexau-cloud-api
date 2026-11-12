@@ -77,16 +77,14 @@ func Setup(ctx context.Context, cfg LogOTelConfig) (*OTel, *slog.Logger, error) 
 		Meter:  otel.GetMeterProvider().Meter("mash-cloud-api"),
 	}
 
-	res, err := sdkresource.Merge(
-		sdkresource.Default(),
-		sdkresource.NewWithAttributes(semconv.SchemaURL,
-			semconv.ServiceName(cfg.ServiceName),
-		),
+	// Build the resource WITHOUT a schema URL of our own (audit L4): merging
+	// two resources with different schema URLs fails spec-wise, and the
+	// resulting "otel resource merge failed - conflicting Schema URL" warning
+	// printed on EVERY boot — training every on-call to skim the startup log.
+	res := sdkresource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName(cfg.ServiceName),
 	)
-	if err != nil {
-		logger.Warn("otel resource merge failed", "error", err)
-		res = sdkresource.Default()
-	}
 
 	// Tracing: OTLP/HTTP if configured, else no-op.
 	if cfg.TraceEndpoint != "" {
@@ -221,7 +219,7 @@ func redactAttr(keys, allow []string, a slog.Attr) slog.Attr {
 	switch strings.ToLower(name) {
 	case "authorization", "api_key", "apikey", "password", "secret", "token",
 		"access_token", "refresh_token", "cookie", "set-cookie",
-		"x-api-key", "x-bifrost-api-key", "bearer", "credential", "link",
+		"x-api-key", "x-openrouter-api-key", "bearer", "credential", "link",
 		"messages", "content", "tools", "prompt", "delta", "arguments",
 		"tool_arguments", "body", "response_body":
 		return slog.String(name, "[REDACTED]")

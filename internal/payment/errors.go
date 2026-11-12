@@ -110,4 +110,10 @@ var (
 	ErrOrderExistsProvider = errors.New("payment: provider order already mapped")
 	// ErrNotFound — storage miss.
 	ErrNotFound = errors.New("payment: not found")
+	// ErrReconcileBudget — the tenant exhausted its per-minute provider-read
+	// budget (confirm/status read-through fan-out, audit H6). 429: retry
+	// after the window; the stored order state remains readable meanwhile.
+	ErrReconcileBudget = func() *domain.Error {
+		return &domain.Error{Code: "RECONCILE_RATE_LIMITED", Message: "Too many status checks; please retry shortly.", HTTP: http.StatusTooManyRequests}
+	}
 )

@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -31,18 +32,18 @@ type Config struct {
 	MaxModelLen  int   // default 256
 
 	// Timeouts (separate concepts, never one global)
-	WriteTimeout       time.Duration // HTTP write timeout (0 = none; streams manage own)
-	ReadHeaderTimeout  time.Duration // default 10s
-	IdleTimeout        time.Duration // default 120s
-	AuthTimeout        time.Duration // auth verification budget (default 3s)
-	DBTimeout          time.Duration // single statement budget (default 5s)
-	RedisTimeout       time.Duration // single command budget (default 500ms)
-	StreamIdleTimeout  time.Duration // no upstream chunk → abort (default 300s, Bifrost parity)
-	StreamMaxDuration  time.Duration // hard cap of one stream (default 15m)
-	BifrostDialTimeout time.Duration // default 10s
-	BifrostTLSTimeout  time.Duration // default 10s
-	BifrostHeaderTO    time.Duration // response header wait (default 60s)
-	BifrostReqTimeout  time.Duration // non-stream LLM call cap (default 120s)
+	WriteTimeout        time.Duration // HTTP write timeout (0 = none; streams manage own)
+	ReadHeaderTimeout   time.Duration // default 10s
+	IdleTimeout         time.Duration // default 120s
+	AuthTimeout         time.Duration // auth verification budget (default 3s)
+	DBTimeout           time.Duration // single statement budget (default 5s)
+	RedisTimeout        time.Duration // single command budget (default 500ms)
+	StreamIdleTimeout   time.Duration // no upstream chunk → abort (default 300s)
+	StreamMaxDuration   time.Duration // hard cap of one stream (default 15m)
+	UpstreamDialTimeout time.Duration // default 10s
+	UpstreamTLSTimeout  time.Duration // default 10s
+	UpstreamHeaderTO    time.Duration // response header wait (default 60s)
+	UpstreamReqTimeout  time.Duration // non-stream LLM call cap (default 120s)
 
 	// SSE stream transport
 	StreamWriteDeadline     time.Duration // per-event client write deadline (default 10s)
@@ -54,8 +55,8 @@ type Config struct {
 	// Payments (prepaid credit top-ups via Razorpay; docs/PAYMENT-GATEWAY.md)
 	Payments PaymentConfig
 
-	// Bifrost
-	Bifrost BifrostConfig
+	// OpenRouter (direct upstream)
+	OpenRouter OpenRouterConfig
 
 	// PostgreSQL
 	DatabaseURL       string
@@ -77,6 +78,10 @@ type Config struct {
 	// Token accounting (normalization weights cache TTL; the weights
 	// themselves live in the token_normalization table).
 	NormCacheTTL time.Duration // default 30s
+
+	// Quota reservation lifetime (audit H2): how long an admission-time
+	// token reservation survives without reconciliation. Default 20m.
+	QuotaReserveTTL time.Duration
 
 	// Observability
 	Log  LogConfig
@@ -124,12 +129,14 @@ type AuthConfig struct {
 	MaxOAuthPerIP           int // GET  /v1/auth/oauth/google{,/callback} (Redis state, default 60)
 }
 
-// BifrostConfig is the upstream gateway connection.
-type BifrostConfig struct {
-	BaseURL             string // e.g. http://bifrost:8080
+// OpenRouterConfig is the direct upstream connection (OpenRouter API).
+type OpenRouterConfig struct {
+	BaseURL             string // default https://openrouter.ai/api
 	APIKey              string // cloud-side credential; never logged, never returned
 	APIKeyFile          string // optional path; takes precedence (secret-file friendly)
-	HealthURL           string // default {BaseURL}/health
+	Referer             string // optional HTTP-Referer attribution header
+	Title               string // optional X-OpenRouter-Title attribution header
+	HealthURL           string // default {BaseURL}/v1/key
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
 	MaxConnsPerHost     int
@@ -139,7 +146,7 @@ type BifrostConfig struct {
 	RetryMinBackoff     time.Duration // default 100ms
 	RetryMaxBackoff     time.Duration // default 2s
 
-	// Upstream circuit breaker (NEXAU_BIFROST_CB_* env knobs; defaults
+	// Upstream circuit breaker (NEXAU_OPENROUTER_CB_* env knobs; defaults
 	// below). Failures counted: network errors, 5xx, 408, mid-stream
 	// gateway faults. Not counted: 4xx/429 (gateway alive), in-band
 	// provider errors, client cancellations.
@@ -163,6 +170,7 @@ type RateLimitConfig struct {
 	IPRequestsPerMinute      int64         // default 1200 (auth + create endpoints)
 	FailOpen                 bool          // default true (availability with alarm)
 	SlotTimeout              time.Duration // how long a stale concurrent slot self-expires (default 30m)
+	ReadRPM                  int64         // per-user RPM for read/aggregation routes (/v1/me, /v1/usage) — default 60 (audit M7)
 }
 
 // MeterConfig bounds the async usage recorder.
@@ -171,6 +179,7 @@ type MeterConfig struct {
 	BatchSize     int           // flush batch (default 128)
 	FlushInterval time.Duration // default 500ms
 	RetryMax      int           // per-batch retries on DB failure (default 3)
+	SpillPath     string        // durable outbox for failed records (audit H3); default ./metering-spill.jsonl
 }
 
 // LogConfig is structured logging.
@@ -200,7 +209,12 @@ type PaymentConfig struct {
 	PhonepeRedirectURL  string // frontend return page (absolute URL)
 	PhonepeRedirectMode string // POST | REDIRECT
 	PhonepeCallbackURL  string // public API base + /v1/payments/webhook
-	PhonepeAPIBase      string // "" → phonepe.DefaultBaseURL (preprod override)
+	AllowMock           bool   // explicit opt-in for provider=mock (audit M13; never in prod manifests)
+	ReconcilePerMinute  int    // provider-read budget per tenant/min for confirm+status (audit H6, default 30)
+
+	UsageRetentionDays   int    // raw llm_calls retention (audit H9; default 400 — above the 366d query window)
+	WebhookRetentionDays int    // webhook payload retention (audit H9; default 90)
+	PhonepeAPIBase       string // "" → phonepe.DefaultBaseURL (preprod override)
 
 	// CatalogJSON optionally overrides the built-in plan SKUs.
 	CatalogJSON string
@@ -210,11 +224,12 @@ type PaymentConfig struct {
 	// trigger; 0 = manual via tests only).
 	MockAutoCapture time.Duration
 
-	OrderTTL        time.Duration // pending order expiry
-	SweepInterval   time.Duration // background sweeper cadence
-	HistoryLimit    int
-	CheckoutPerUser int // checkout requests / user / hour
-	WebhookPerIP    int // webhook posts / IP / min
+	OrderTTL          time.Duration // pending order expiry
+	SweepInterval     time.Duration // background sweeper cadence
+	LateCaptureWindow time.Duration // how long expired orders stay re-checked (audit H5, default 24h)
+	HistoryLimit      int
+	CheckoutPerUser   int // checkout requests / user / hour
+	WebhookPerIP      int // webhook posts / IP / min
 }
 
 // OTelConfig is tracing/metrics export.
@@ -252,10 +267,10 @@ func Load() (*Config, error) {
 		RedisTimeout:            envDur("NEXAU_REDIS_TIMEOUT", 500*time.Millisecond),
 		StreamIdleTimeout:       envDur("NEXAU_STREAM_IDLE_TIMEOUT", 300*time.Second),
 		StreamMaxDuration:       envDur("NEXAU_STREAM_MAX_DURATION", 15*time.Minute),
-		BifrostDialTimeout:      envDur("NEXAU_BIFROST_DIAL_TIMEOUT", 10*time.Second),
-		BifrostTLSTimeout:       envDur("NEXAU_BIFROST_TLS_TIMEOUT", 10*time.Second),
-		BifrostHeaderTO:         envDur("NEXAU_BIFROST_HEADER_TIMEOUT", 60*time.Second),
-		BifrostReqTimeout:       envDur("NEXAU_BIFROST_REQUEST_TIMEOUT", 120*time.Second),
+		UpstreamDialTimeout:     envDur("NEXAU_OPENROUTER_DIAL_TIMEOUT", 10*time.Second),
+		UpstreamTLSTimeout:      envDur("NEXAU_OPENROUTER_TLS_TIMEOUT", 10*time.Second),
+		UpstreamHeaderTO:        envDur("NEXAU_OPENROUTER_HEADER_TIMEOUT", 60*time.Second),
+		UpstreamReqTimeout:      envDur("NEXAU_OPENROUTER_REQUEST_TIMEOUT", 120*time.Second),
 		StreamWriteDeadline:     envDur("NEXAU_STREAM_WRITE_DEADLINE", 10*time.Second),
 		StreamHeartbeatInterval: envDur("NEXAU_STREAM_HEARTBEAT_INTERVAL", 15*time.Second),
 
@@ -303,7 +318,7 @@ func Load() (*Config, error) {
 		MaxOAuthPerIP:           envInt("NEXAU_AUTH_OAUTH_PER_IP", 60),
 	}
 
-	// Secret-file override for the HS256 key (mirrors BIFROST_API_KEY_FILE):
+	// Secret-file override for the HS256 key (mirrors NEXAU_OPENROUTER_API_KEY_FILE):
 	// Docker/k8s secret mounts beat env vars on the filesystem boundary.
 	if f := os.Getenv("NEXAU_AUTH_HS256_SECRET_FILE"); f != "" {
 		b, err := os.ReadFile(f)
@@ -332,51 +347,57 @@ func Load() (*Config, error) {
 		PhonepeRedirectURL:    strings.TrimSpace(os.Getenv("NEXAU_PHONEPE_REDIRECT_URL")),
 		PhonepeRedirectMode:   strings.ToUpper(envStr("NEXAU_PHONEPE_REDIRECT_MODE", "POST")),
 		PhonepeCallbackURL:    strings.TrimSpace(os.Getenv("NEXAU_PHONEPE_CALLBACK_URL")),
-		PhonepeAPIBase:        strings.TrimRight(os.Getenv("NEXAU_PHONEPE_API_BASE"), "/"),
-		CatalogJSON:           os.Getenv("NEXAU_PAYMENT_CATALOG_JSON"),
-		OrderTTL:              envDur("NEXAU_PAYMENT_ORDER_TTL", 15*time.Minute),
-		SweepInterval:         envDur("NEXAU_PAYMENT_SWEEP_INTERVAL", time.Minute),
-		HistoryLimit:          envInt("NEXAU_PAYMENT_HISTORY_LIMIT", 50),
-		MockAutoCapture:       envDur("NEXAU_PAYMENT_MOCK_AUTOCAPTURE", 3*time.Second),
-		CheckoutPerUser:       envInt("NEXAU_PAYMENT_CHECKOUT_PER_USER", 20),
-		WebhookPerIP:          envInt("NEXAU_PAYMENT_WEBHOOK_PER_IP", 120),
+		AllowMock:             envBool("NEXAU_PAYMENT_ALLOW_MOCK", false),
+		ReconcilePerMinute:    envInt("NEXAU_PAYMENT_RECONCILE_RPM", 30),
+
+		UsageRetentionDays:   envInt("NEXAU_USAGE_RETENTION_DAYS", 400),
+		WebhookRetentionDays: envInt("NEXAU_WEBHOOK_RETENTION_DAYS", 90),
+		PhonepeAPIBase:       strings.TrimRight(os.Getenv("NEXAU_PHONEPE_API_BASE"), "/"),
+		CatalogJSON:          os.Getenv("NEXAU_PAYMENT_CATALOG_JSON"),
+		OrderTTL:             envDur("NEXAU_PAYMENT_ORDER_TTL", 15*time.Minute),
+		SweepInterval:        envDur("NEXAU_PAYMENT_SWEEP_INTERVAL", time.Minute),
+		LateCaptureWindow:    envDur("NEXAU_PAYMENT_LATE_CAPTURE_WINDOW", 24*time.Hour),
+		HistoryLimit:         envInt("NEXAU_PAYMENT_HISTORY_LIMIT", 50),
+		MockAutoCapture:      envDur("NEXAU_PAYMENT_MOCK_AUTOCAPTURE", 3*time.Second),
+		CheckoutPerUser:      envInt("NEXAU_PAYMENT_CHECKOUT_PER_USER", 20),
+		WebhookPerIP:         envInt("NEXAU_PAYMENT_WEBHOOK_PER_IP", 120),
 	}
 
-	// Bifrost
-	c.Bifrost = BifrostConfig{
-		BaseURL:             strings.TrimRight(os.Getenv("NEXAU_BIFROST_URL"), "/"),
-		APIKey:              os.Getenv("NEXAU_BIFROST_API_KEY"),
-		APIKeyFile:          os.Getenv("NEXAU_BIFROST_API_KEY_FILE"),
-		MaxIdleConns:        envInt("NEXAU_BIFROST_MAX_IDLE_CONNS", 512),
-		MaxIdleConnsPerHost: envInt("NEXAU_BIFROST_MAX_IDLE_CONNS_PER_HOST", 256),
-		MaxConnsPerHost:     envInt("NEXAU_BIFROST_MAX_CONNS_PER_HOST", 0), // 0 = unlimited
-		IdleConnTimeout:     envDur("NEXAU_BIFROST_IDLE_CONN_TIMEOUT", 90*time.Second),
-		DisableHTTP2:        envBool("NEXAU_BIFROST_DISABLE_HTTP2", false),
-		MaxRetries:          envInt("NEXAU_BIFROST_MAX_RETRIES", 2),
-		RetryMinBackoff:     envDur("NEXAU_BIFROST_RETRY_MIN_BACKOFF", 100*time.Millisecond),
-		RetryMaxBackoff:     envDur("NEXAU_BIFROST_RETRY_MAX_BACKOFF", 2*time.Second),
+	// OpenRouter (direct upstream; default is the public service)
+	c.OpenRouter = OpenRouterConfig{
+		BaseURL:             strings.TrimRight(envStr("NEXAU_OPENROUTER_URL", "https://openrouter.ai/api"), "/"),
+		APIKey:              os.Getenv("NEXAU_OPENROUTER_API_KEY"),
+		APIKeyFile:          os.Getenv("NEXAU_OPENROUTER_API_KEY_FILE"),
+		Referer:             os.Getenv("NEXAU_OPENROUTER_REFERER"),
+		Title:               os.Getenv("NEXAU_OPENROUTER_TITLE"),
+		MaxIdleConns:        envInt("NEXAU_OPENROUTER_MAX_IDLE_CONNS", 512),
+		MaxIdleConnsPerHost: envInt("NEXAU_OPENROUTER_MAX_IDLE_CONNS_PER_HOST", 256),
+		MaxConnsPerHost:     envInt("NEXAU_OPENROUTER_MAX_CONNS_PER_HOST", 0), // 0 = unlimited
+		IdleConnTimeout:     envDur("NEXAU_OPENROUTER_IDLE_CONN_TIMEOUT", 90*time.Second),
+		DisableHTTP2:        envBool("NEXAU_OPENROUTER_DISABLE_HTTP2", false),
+		MaxRetries:          envInt("NEXAU_OPENROUTER_MAX_RETRIES", 2),
+		RetryMinBackoff:     envDur("NEXAU_OPENROUTER_RETRY_MIN_BACKOFF", 100*time.Millisecond),
+		RetryMaxBackoff:     envDur("NEXAU_OPENROUTER_RETRY_MAX_BACKOFF", 2*time.Second),
 
-		CBEnabled:        envBool("NEXAU_BIFROST_CB_ENABLED", true),
-		CBConsecutive:    envInt("NEXAU_BIFROST_CB_CONSECUTIVE", 10),
-		CBWindow:         envInt("NEXAU_BIFROST_CB_WINDOW", 60),
-		CBMinSamples:     envInt("NEXAU_BIFROST_CB_MIN_SAMPLES", 30),
-		CBFailureRate:    envFloat("NEXAU_BIFROST_CB_FAILURE_RATE", 0.60),
-		CBOpenBase:       envDur("NEXAU_BIFROST_CB_OPEN_BASE", 30*time.Second),
-		CBOpenMax:        envDur("NEXAU_BIFROST_CB_OPEN_MAX", 5*time.Minute),
-		CBHalfOpenProbes: envInt("NEXAU_BIFROST_CB_HALFOPEN_PROBES", 3),
+		CBEnabled:        envBool("NEXAU_OPENROUTER_CB_ENABLED", true),
+		CBConsecutive:    envInt("NEXAU_OPENROUTER_CB_CONSECUTIVE", 10),
+		CBWindow:         envInt("NEXAU_OPENROUTER_CB_WINDOW", 60),
+		CBMinSamples:     envInt("NEXAU_OPENROUTER_CB_MIN_SAMPLES", 30),
+		CBFailureRate:    envFloat("NEXAU_OPENROUTER_CB_FAILURE_RATE", 0.60),
+		CBOpenBase:       envDur("NEXAU_OPENROUTER_CB_OPEN_BASE", 30*time.Second),
+		CBOpenMax:        envDur("NEXAU_OPENROUTER_CB_OPEN_MAX", 5*time.Minute),
+		CBHalfOpenProbes: envInt("NEXAU_OPENROUTER_CB_HALFOPEN_PROBES", 3),
 	}
-	if c.Bifrost.BaseURL != "" {
-		c.Bifrost.HealthURL = c.Bifrost.BaseURL + "/health"
-		if v := os.Getenv("NEXAU_BIFROST_HEALTH_URL"); v != "" {
-			c.Bifrost.HealthURL = v
-		}
+	c.OpenRouter.HealthURL = c.OpenRouter.BaseURL + "/v1/key"
+	if v := os.Getenv("NEXAU_OPENROUTER_HEALTH_URL"); v != "" {
+		c.OpenRouter.HealthURL = v
 	}
-	if c.Bifrost.APIKeyFile != "" {
-		b, err := os.ReadFile(c.Bifrost.APIKeyFile)
+	if c.OpenRouter.APIKeyFile != "" {
+		b, err := os.ReadFile(c.OpenRouter.APIKeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("config: read BIFROST_API_KEY_FILE: %w", err)
+			return nil, fmt.Errorf("config: read NEXAU_OPENROUTER_API_KEY_FILE: %w", err)
 		}
-		c.Bifrost.APIKey = strings.TrimSpace(string(b))
+		c.OpenRouter.APIKey = strings.TrimSpace(string(b))
 	}
 
 	// Rate limits
@@ -388,6 +409,7 @@ func Load() (*Config, error) {
 		IPRequestsPerMinute:      envInt64("NEXAU_RATE_REQ_PER_MIN_IP", 1200),
 		FailOpen:                 envBool("NEXAU_RATE_FAIL_OPEN", true),
 		SlotTimeout:              envDur("NEXAU_RATE_CONCURRENCY_TIMEOUT", 30*time.Minute),
+		ReadRPM:                  envInt64("NEXAU_RATE_READ_RPM", 60),
 	}
 
 	// Metering
@@ -396,7 +418,13 @@ func Load() (*Config, error) {
 		BatchSize:     envInt("NEXAU_METER_BATCH_SIZE", 128),
 		FlushInterval: envDur("NEXAU_METER_FLUSH_INTERVAL", 500*time.Millisecond),
 		RetryMax:      envInt("NEXAU_METER_RETRY_MAX", 3),
+		SpillPath:     envStr("NEXAU_METER_SPILL_PATH", "metering-spill.jsonl"),
 	}
+
+	// Quota reservation lifetime (audit H2): must outlive the longest stream
+	// plus the metering pipeline (flush + retries) so an in-flight call's
+	// reserved tokens are never expired while the call still runs.
+	c.QuotaReserveTTL = envDur("NEXAU_QUOTA_RESERVE_TTL", 20*time.Minute)
 
 	// Token accounting: how long a normalization-rules read stays fresh
 	// (UPDATE token_normalization ... takes effect within this TTL).
@@ -436,8 +464,11 @@ func (c *Config) validate() error {
 	if c.RedisURL == "" {
 		errs = append(errs, "NEXAU_REDIS_URL is required")
 	}
-	if c.Bifrost.BaseURL == "" {
-		errs = append(errs, "NEXAU_BIFROST_URL is required")
+	if c.OpenRouter.BaseURL == "" {
+		errs = append(errs, "NEXAU_OPENROUTER_URL is required")
+	}
+	if c.OpenRouter.APIKey == "" {
+		errs = append(errs, "NEXAU_OPENROUTER_API_KEY is required (the OpenRouter API key is the cloud-side LLM credential)")
 	}
 	if len(c.Auth.HS256Secret) < 32 {
 		errs = append(errs, "NEXAU_AUTH_HS256_SECRET must be ≥32 bytes")
@@ -512,6 +543,37 @@ func (c *Config) validate() error {
 	if c.Payments.OrderTTL < time.Minute {
 		errs = append(errs, "NEXAU_PAYMENT_ORDER_TTL must be ≥1m")
 	}
+	if c.Payments.LateCaptureWindow < time.Hour || c.Payments.LateCaptureWindow > 14*24*time.Hour {
+		errs = append(errs, "NEXAU_PAYMENT_LATE_CAPTURE_WINDOW must be within [1h,14d]")
+	}
+	if c.Payments.ReconcilePerMinute < 0 || c.Payments.ReconcilePerMinute > 10_000 {
+		errs = append(errs, "NEXAU_PAYMENT_RECONCILE_RPM must be within [0,10000]")
+	}
+	// Retention must keep at least the visible query window (audit H9):
+	// /v1/usage answers up to 366 days back; purging inside that window
+	// would silently change reported numbers.
+	if c.Payments.UsageRetentionDays < 396 || c.Payments.UsageRetentionDays > 3650 {
+		errs = append(errs, "NEXAU_USAGE_RETENTION_DAYS must be within [396,3650] (above the 366-day usage query window)")
+	}
+	if c.Payments.WebhookRetentionDays < 7 || c.Payments.WebhookRetentionDays > 3650 {
+		errs = append(errs, "NEXAU_WEBHOOK_RETENTION_DAYS must be within [7,3650]")
+	}
+	// Audit M12: with provider=phonepe the callback URL is half of the
+	// payment-recovery design (no webhook means only the browser return
+	// can confirm a capture). A boot without it used to succeed silently
+	// and the misconfiguration surfaced at the customer expense. Fail
+	// boot, exactly like a missing webhook secret does.
+	if c.Payments.Provider == "phonepe" && c.Payments.PhonepeCallbackURL == "" {
+		errs = append(errs, "NEXAU_PHONEPE_CALLBACK_URL is required when NEXAU_PAYMENT_PROVIDER=phonepe (webhook recovery depends on it)")
+	}
+	// Audit M13: provider=mock must be an EXPLICIT dev opt-in. A
+	// copy-pasted staging manifest reaching production with mock set
+	// used to serve a payment system whose signing secrets are committed
+	// to the repository — webhook forgery on such a deployment equals
+	// free Pro plans.
+	if c.Payments.Provider == "mock" && !c.Payments.AllowMock {
+		errs = append(errs, "NEXAU_PAYMENT_PROVIDER=mock requires NEXAU_PAYMENT_ALLOW_MOCK=true (dev/test only — mock secrets are public)")
+	}
 	if c.Payments.SweepInterval < 5*time.Second {
 		errs = append(errs, "NEXAU_PAYMENT_SWEEP_INTERVAL must be ≥5s")
 	}
@@ -531,8 +593,8 @@ func (c *Config) validate() error {
 	if c.StreamMaxDuration <= c.StreamIdleTimeout {
 		errs = append(errs, "NEXAU_STREAM_MAX_DURATION must exceed STREAM_IDLE_TIMEOUT")
 	}
-	if c.BifrostReqTimeout < 5*time.Second {
-		errs = append(errs, "NEXAU_BIFROST_REQUEST_TIMEOUT must be ≥5s")
+	if c.UpstreamReqTimeout < 5*time.Second {
+		errs = append(errs, "NEXAU_OPENROUTER_REQUEST_TIMEOUT must be ≥5s")
 	}
 	if c.StreamHeartbeatInterval < time.Second {
 		errs = append(errs, "NEXAU_STREAM_HEARTBEAT_INTERVAL must be ≥1s")
@@ -549,12 +611,35 @@ func (c *Config) validate() error {
 	if c.Rate.SlotTimeout < time.Minute {
 		errs = append(errs, "NEXAU_RATE_CONCURRENCY_TIMEOUT must be ≥1m")
 	}
+	// A live stream must never outlive its own concurrency slot: slots
+	// self-expire one SlotTimeout after claim (per-holder expiry), so a
+	// SlotTimeout shorter than the max stream duration would silently
+	// over-admit past the plan's concurrency limit (audit H1 hardening).
+	if c.Rate.SlotTimeout <= c.StreamMaxDuration {
+		errs = append(errs, "NEXAU_RATE_CONCURRENCY_TIMEOUT must exceed NEXAU_STREAM_MAX_DURATION (slots expire while long streams still run)")
+	}
+	if c.Rate.ReadRPM < 0 || c.Rate.ReadRPM > 100_000 {
+		errs = append(errs, "NEXAU_RATE_READ_RPM must be within [0,100000]")
+	}
+	// Reservation lifetime must cover admission → durable metering for the
+	// longest possible stream (audit H2).
+	if c.QuotaReserveTTL <= c.StreamMaxDuration {
+		errs = append(errs, "NEXAU_QUOTA_RESERVE_TTL must exceed NEXAU_STREAM_MAX_DURATION (reservations would expire mid-stream)")
+	}
 
 	// Google OAuth wiring sanity (only meaningful when fully configured).
 	googleOn := c.Auth.GoogleClientID != "" && c.Auth.GoogleClientSecret != "" && c.Auth.GoogleRedirectURL != ""
 	if googleOn {
 		if c.Auth.WebSuccessURL == "" {
 			errs = append(errs, "NEXAU_AUTH_WEB_SUCCESS_URL is required when Google sign-in is enabled")
+		} else if !httpsURL(c.Auth.WebSuccessURL) {
+			// Audit L13: humans paste URLs in surprising shapes; a scheme-less
+			// "evil.example" becomes an attacker-shaped redirect target. https
+			// only (http tolerated on explicit loopback for local dev).
+			errs = append(errs, "NEXAU_AUTH_WEB_SUCCESS_URL must be an absolute https:// URL")
+		}
+		if c.Auth.WebLoginURL != "" && !httpsURL(c.Auth.WebLoginURL) {
+			errs = append(errs, "NEXAU_AUTH_WEB_LOGIN_URL must be an absolute https:// URL")
 		}
 	}
 	if c.Auth.DesktopCodeTTL < 10*time.Second || c.Auth.DesktopCodeTTL > 10*time.Minute {
@@ -683,3 +768,17 @@ func runtimeNumCPU() int {
 // ErrNoAuthPath is a sentinel used by main.go to warn (not fail) when no
 // Google OAuth is configured — no client could ever log in.
 var ErrNoAuthPath = errors.New("config: google oauth not configured")
+
+// httpsURL reports whether the value is an absolute https URL (or an http
+// loopback URL for local development).
+func httpsURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	return u.Scheme == "http" &&
+		(strings.HasPrefix(u.Host, "localhost") || strings.HasPrefix(u.Host, "127.0.0.1"))
+}

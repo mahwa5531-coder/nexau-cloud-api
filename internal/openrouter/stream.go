@@ -1,4 +1,4 @@
-package bifrost
+package openrouter
 
 import (
 	"bufio"
@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net/http"
 	"sync"
 	"time"
 
@@ -20,7 +19,7 @@ const (
 	maxSSELine = 1 << 20 // 1 MiB
 )
 
-// StreamReader consumes a Bifrost SSE stream incrementally. It:
+// StreamReader consumes an OpenRouter SSE stream incrementally. It:
 //   - parses "data: …" lines and the "[DONE]" sentinel,
 //   - feeds an idle watchdog (no chunk within IdleTimeout → abort upstream),
 //   - propagates context cancellation to the underlying connection,
@@ -63,8 +62,8 @@ func newStreamReader(ctx context.Context, body io.ReadCloser, metrics *observabi
 	// cancellation of the REQUEST context, not of this derived context, so
 	// cancel() alone would leave the Read blocked until the total-duration
 	// cap. Closing the body aborts the upstream request immediately — same
-	// abort semantic as Close(), telling Bifrost to stop pulling from the
-	// provider — and unblocks the pending Read.
+	// abort semantic as Close(), telling OpenRouter to stop generating
+	// (billing stops on supported providers) — and unblocks the pending Read.
 	idle, _ := ctx.Value(idleTimeoutKey{}).(time.Duration)
 	if idle <= 0 {
 		idle = 300 * time.Second
@@ -147,19 +146,19 @@ func (sr *StreamReader) Next() (chunk *ChatChunk, raw []byte, done bool, err err
 					if c.ID != "" {
 						sr.lastID = c.ID
 					}
-					// An in-band Bifrost error chunk (200 stream with error
+					// An in-band error chunk (200 stream with error
 					// payload) surfaces as a domain error immediately.
 					if berr := errorFromChunk(c); berr != nil {
 						return nil, nil, false, berr
 					}
 				}
 				if sr.metrics != nil {
-					sr.metrics.BifrostStreamEvents.Add(sr.ctx, 1)
+					sr.metrics.UpstreamStreamEvents.Add(sr.ctx, 1)
 				}
 				return c, value, false, nil
 			case "event":
-				// Bifrost chat-completions streams use data-only lines; event
-				// lines from other surface routes are ignored safely.
+				// OpenRouter chat-completions streams use data-only lines;
+				// event lines from other surface routes are ignored safely.
 			case "id":
 				sr.lastID = string(value)
 			}
@@ -283,25 +282,14 @@ func decodeChunk(raw []byte) (*ChatChunk, error) {
 	return c, nil
 }
 
-// errorFromChunk detects BifrostError payloads riding inside 200-OK streams.
+// errorFromChunk detects error payloads riding inside 200-OK streams
+// (OpenRouter: top-level error object with a numeric code and a terminal
+// finish_reason "error").
 func errorFromChunk(c *ChatChunk) error {
 	if !c.IsError() {
 		return nil
 	}
-	ef := c.Error
-	if ef == nil {
-		ef = &ErrorField{}
-	}
-	be := &ErrorResponse{
-		Type:           c.Type,
-		IsBifrostError: true,
-		StatusCode:     c.StatusCode,
-		Error:          *ef,
-	}
-	if be.StatusCode == 0 {
-		be.StatusCode = http.StatusInternalServerError
-	}
-	return be.toDomain(be.StatusCode)
+	return errorFieldToDomain(c.Error, 0, 0)
 }
 
 func splitSSELine(line []byte) (field, value []byte, ok bool) {

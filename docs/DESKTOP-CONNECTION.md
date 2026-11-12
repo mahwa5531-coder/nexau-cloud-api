@@ -1,7 +1,7 @@
-# Desktop ↔ Cloud API ↔ Bifrost — The Single Connection Document
+# Desktop ↔ Cloud API ↔ OpenRouter — The Single Connection Document
 
 > **Scope.** This is the one document that answers: *how does the MASh desktop
-> application connect to the cloud, and how does that relate to Bifrost?*
+> application connect to the cloud, and how does that relate to OpenRouter?*
 > Everything here is stated from **verified code in this repository** (file
 > paths cited) or from **the desktop team's own written spec** (labelled as
 > such). Nothing is guessed. Where something is still to be built on the
@@ -12,33 +12,33 @@
 
 ## 1. The one-paragraph answer
 
-**The desktop never connects to Bifrost. Ever.** Bifrost is a cloud-internal
-service reachable only from inside the cloud network. The desktop connects to
+**The desktop never connects to OpenRouter. Ever.** OpenRouter is a
+cloud-side dependency reachable only from the cloud. The desktop connects to
 **exactly one external thing: the NexaU Cloud API** (`https://api.<your-domain>`)
 over HTTPS with its own user token. The Cloud API is the **only** party that
-talks to Bifrost, using the **single** cloud-held credential
-(`NEXAU_BIFROST_API_KEY`, see `internal/config/config.go` + `.env.example`).
-No Bifrost URL, no provider key, no gateway secret ever reaches a user
+talks to OpenRouter, using the **single** cloud-held credential
+(`NEXAU_OPENROUTER_API_KEY`, see `internal/config/config.go` + compose.yaml).
+No OpenRouter key, no provider key, no gateway secret ever reaches a user
 machine — that is what "fully managed, not BYOK" means in the wire topology:
 
 ```
-┌──────────────────────┐   HTTPS + user JWT   ┌──────────────────────┐  internal HTTP + 1 key  ┌──────────┐
-│  NexaU Desktop app   │ ───────────────────> │  NexaU Cloud API     │ ─────────────────────> │ Bifrost  │──> 23+ LLMs
-│  (local, user PC)   │        SSE / POST     │  (stateless, N pods) │  POST /v1/chat/         │ (gateway)│
-└──────────────────────┘                      └──────────────────────┘  completions             └──────────┘
-  holds: access + refresh        ▲                     ▲                                       ▲
-  tokens only (DPAPI vault)      │                     │                                       │
-                                 │                     └── holds the ONLY Bifrost credential ──┘
-  NEVER holds: Bifrost URL/key ──┘                         (never sent to any client)
+┌──────────────────────┐   HTTPS + user JWT   ┌──────────────────────┐    HTTPS + 1 API key    ┌────────────┐
+│  NexaU Desktop app   │ ───────────────────> │  NexaU Cloud API     │ ─────────────────────> │ OpenRouter │─> 400+ LLMs
+│  (local, user PC)   │        SSE / POST     │  (stateless, N pods) │  POST /api/v1/chat/     │  (BYOK)    │  (provider
+└──────────────────────┘                      └──────────────────────┘  completions             └────────────┘   routing)
+  holds: access + refresh        ▲                     ▲
+  tokens only (DPAPI vault)      │                     │
+                                 │                     └── holds the ONLY OpenRouter credential ─┘
+  NEVER holds: OpenRouter key ───┘                         (never sent to any client)
 ```
 
 | Question | Answer | Where it is enforced |
 |---|---|---|
-| Does the desktop call Bifrost? | **No.** No Bifrost address exists in any client-facing response. | `internal/bifrost/` is server-side only; `/v1/config` (`internal/api/me.go:51`) returns transports/limits only |
+| Does the desktop call OpenRouter? | **No.** No OpenRouter address exists in any client-facing response. | `internal/openrouter/` is server-side only; `/v1/config` (`internal/api/me.go:51`) returns transports/limits only |
 | What does the desktop call? | The Cloud API base URL, e.g. `https://api.mash.ai` | `README.md` endpoint table |
 | What credential does the desktop hold? | Its own JWT access token (1 h) + rotating refresh token (30 d) in the OS vault | `internal/auth/service.go:80` (`TokenPair`) |
-| What credential does the API use for Bifrost? | One global Bearer key, env-injected, server-side only | `.env.example` lines 7–12 |
-| If Bifrost scales to 100 replicas? | Invisible to both API and desktop (K8s Service VIP / LB in front of Bifrost; the API has one URL) | `docs/ARCHITECTURE.md` |
+| What credential does the API use for OpenRouter? | One global Bearer key (`NEXAU_OPENROUTER_API_KEY`), env-injected, server-side only | `compose.yaml`, `internal/config/config.go` |
+| If OpenRouter scales? | Invisible to both API and desktop (OpenRouter is a managed service; the API has one URL) | `docs/ARCHITECTURE.md` |
 
 ---
 
@@ -81,33 +81,35 @@ machine — that is what "fully managed, not BYOK" means in the wire topology:
 | `Authorization: Bearer <access_token>` | ✅ | 1 h TTL (`NEXAU_AUTH_ACCESS_TOKEN_TTL` default in `.env.example`) |
 | `refresh_token` to `/v1/auth/refresh` | ✅ | rotation; reuse of an old one revokes the whole family (theft detection) |
 | `device_name`, `platform` (windows/macos/linux/…) at exchange time | ✅ | whitelisted platforms (`internal/auth/desktop_code.go:40`) |
-| Any Bifrost model list / provider hints | ⚠️ | models come **down** from `/v1/me` + `/v1/config` (entitlements); the desktop does not choose providers |
+| Any provider/model hints beyond entitlements | ⚠️ | models come **down** from `/v1/me` + `/v1/config` (entitlements); the desktop does not choose providers |
 
 ---
 
-## 3. Connection 2 — Cloud API → Bifrost (cloud-internal; the desktop is never involved)
+## 3. Connection 2 — Cloud API → OpenRouter (cloud-side; the desktop is never involved)
 
-*Verified from `internal/bifrost/client.go` (package doc, `NewClient`) and
-`.env.example`.*
+*Verified from `internal/openrouter/client.go` (package doc, `NewClient`) and
+`internal/config/config.go`.*
 
-- **One URL** (`NEXAU_BIFROST_URL`, e.g. `http://bifrost:8081` — internal
-  service address) and **one Bearer key** (`NEXAU_BIFROST_API_KEY` or
-  `NEXAU_BIFROST_API_KEY_FILE` for secret mounts).
-- **Protocol**: Bifrost's OpenAI-compatible chat-completions surface:
-  `POST {base}/v1/chat/completions`, `model = "provider/model"`, SSE
-  `data: … / data: [DONE]`, with `finish_reason` + `usage` standardized into
-  the **last** chunk (verified against maximhq/bifrost's OpenAPI).
+- **One URL** (`NEXAU_OPENROUTER_URL`, default
+  `https://openrouter.ai/api`) and **one Bearer key**
+  (`NEXAU_OPENROUTER_API_KEY` or `NEXAU_OPENROUTER_API_KEY_FILE` for secret
+  mounts).
+- **Protocol**: OpenRouter's OpenAI-compatible chat-completions surface:
+  `POST {base}/v1/chat/completions`, `model = "vendor/model"`, SSE
+  `data: … / data: [DONE]` with `: OPENROUTER PROCESSING` keepalive comments,
+  and `usage` (tokens + cost + `is_byok`) standardized into the **last**
+  chunk (verified against OpenRouter's docs/OpenAPI).
 - **Transport hardening** (why this connection survives production load):
   one shared `http.Client` per process, HTTP/2, bounded connection pools
   (`MaxIdleConnsPerHost` etc.), retries **only before the first byte** (a
   stream never replays mid-flight), 15-minute stream ceiling
   (`NEXAU_STREAM_MAX_DURATION`), idle watchdog
   (`NEXAU_STREAM_IDLE_TIMEOUT=300s`).
-- **Scaling story**: when Bifrost runs 100 replicas behind a K8s Service /
-  LB, the API still dials the same single URL — pod churn is invisible
-  (`docs/ARCHITECTURE.md`, capacity runs in `build/`).
+- **Scaling story**: OpenRouter is a managed multi-region service; the API
+  dials the same single URL, and provider capacity/routing is OpenRouter's
+  concern (`docs/ARCHITECTURE.md`).
 
-**Consequence for the desktop team: there is no Bifrost connection task on
+**Consequence for the desktop team: there is no OpenRouter connection task on
 your side. Zero configuration, zero credentials, zero code.**
 
 ---
@@ -238,7 +240,7 @@ transcript; the cloud buffers nothing).
 | `NEXAU_AUTH_WEB_LOGIN_URL` | error target — receives `?error=<code>` |
 | `NEXAU_AUTH_WEB_SESSION_TTL` (15m) / `NEXAU_AUTH_WEB_GRANT_TTL` (5m) / `NEXAU_AUTH_OAUTH_STATE_TTL` (10m) / `NEXAU_AUTH_DESKTOP_CODE_TTL` (60s) | handshake clockwork |
 | `NEXAU_AUTH_OAUTH_COOKIE_SECURE` | tx-cookie Secure flag (false only for plain-http dev) |
-| `NEXAU_BIFROST_URL` / `NEXAU_BIFROST_API_KEY` | the internal gateway hop — server-side only |
+| `NEXAU_OPENROUTER_URL` / `NEXAU_OPENROUTER_API_KEY` | the direct OpenRouter hop — server-side only |
 
 Google Cloud Console checklist: APIs & Services → Credentials → Create OAuth
 client ID (Web application) → Authorized redirect URI = your
@@ -301,11 +303,11 @@ each row maps to a **finished, tested** cloud endpoint above.
 | User lingered > 60 s | same code | web page mints a fresh mcode; retry with the new one |
 | Access token expired | 401 `UNAUTHORIZED` | refresh; retry once; if refresh fails → vault clear → login again |
 | Refresh token reused (rotation race) | family revoked; 401s | full re-login (this is the theft-detection working) |
-| **Token revoked mid-stream (logout elsewhere)** | stream ends; the next HTTP call is 401 `TOKEN_REVOKED` | treat as forced logout: clear the vault, require re-login |
+| **Token revoked mid-stream (logout elsewhere)** | stream continues to its natural end (no in-band push exists today); the next HTTP call is 401 `TOKEN_REVOKED` | treat the next 401 as forced logout: clear the vault, require re-login |
 | **Stream dropped (network blip)** | SSE read returns EOF / error | the call is over: the cloud canceled the upstream and metered it `cancelled`; replay from the local transcript and retry as a NEW request |
 | Rate limited | 429 + `Retry-After` | honor the header; never hammer |
 | Redis/PG degraded (rare) | 503 `DEPENDENCY_UNAVAILABLE` | back off with jitter |
-| Bifrost gateway failing (cloud protects itself) | 503 `UPSTREAM_CIRCUIT_OPEN`, `details.retry_after_ms` present | back off for `retry_after_ms` (typically seconds); the cloud auto-recovers — probe after the hint, no user action needed |
+| Upstream failing (cloud protects itself) | 503 `UPSTREAM_CIRCUIT_OPEN`, `details.retry_after_ms` present | back off for `retry_after_ms` (typically seconds); the cloud auto-recovers — probe after the hint, no user action needed |
 
 **Bottom line:** the desktop needs **one base URL** and **one pair of tokens**
-— everything else (Bifrost, providers, keys, scaling) is the cloud's problem.
+— everything else (OpenRouter, providers, keys, scaling) is the cloud's problem.

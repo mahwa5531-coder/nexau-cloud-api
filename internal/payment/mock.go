@@ -24,6 +24,9 @@ type MockProvider struct {
 	orders   map[string]*mockOrder
 	payments map[string]*ProviderPayment
 
+	// fetchCount counts provider read calls (H5/H6 tests: bounded fan-out).
+	fetchCount int64
+
 	// KeySecret signs checkout handshakes; WebhookSecret signs webhooks.
 	// Defaults are fixed DEV VALUES — never secrets in any real sense,
 	// but the HMAC code paths run for real.
@@ -73,7 +76,27 @@ func (m *MockProvider) CreateOrder(_ context.Context, req CreateOrderRequest) (*
 }
 
 // FetchOrder implements Provider.
+// fetches counts provider read calls (FetchOrder): the H5/H6 tests use it
+// to prove fan-out stays bounded.
+func (m *MockProvider) fetches() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fetchCount
+}
+
+// ResetFetchCount zeroes the read-call counter (test setup).
+func (m *MockProvider) ResetFetchCount() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fetchCount = 0
+}
+
+// FetchCount reports provider read calls (test assertions).
+func (m *MockProvider) FetchCount() int64 { return m.fetches() }
 func (m *MockProvider) FetchOrder(_ context.Context, providerOrderID string) (*ProviderOrder, error) {
+	m.mu.Lock()
+	m.fetchCount++
+	m.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	o, ok := m.orders[providerOrderID]

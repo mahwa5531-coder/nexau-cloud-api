@@ -143,6 +143,20 @@ func (f *fakeStore) ListOpenOrders(_ context.Context, limit int) ([]*payment.Ord
 	}
 	return out, nil
 }
+func (f *fakeStore) ListRecentlyExpired(_ context.Context, within time.Duration, limit int) ([]*payment.Order, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*payment.Order
+	for _, o := range f.orders {
+		if o.Status == payment.StatusExpired && time.Since(o.ExpiresAt) < within {
+			out = append(out, o)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
 
 func (f *fakeStore) MarkAttempted(_ context.Context, orderID, providerPaymentID string) error {
 	f.mu.Lock()
@@ -245,6 +259,19 @@ func (f *fakeStore) RecordWebhookEvent(_ context.Context, ev *payment.WebhookEve
 	}
 	f.events[ev.EventID] = ev
 	return false, nil
+}
+
+// ExpireOrderAtForTest force-expires an order with the given expiry
+// instant (H5 scenario setup: an order whose TTL passed without capture).
+func (f *fakeStore) ExpireOrderAtForTest(orderID string, expiredAt time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o, ok := f.orders[orderID]
+	if !ok {
+		return
+	}
+	o.Status = payment.StatusExpired
+	o.ExpiresAt = expiredAt
 }
 
 // PlanExists mirrors the repo: does the plan code resolve?

@@ -52,9 +52,10 @@ produced these items live in git history (see "Audit history" below).
 |---|---|---|
 | 2026-09-17 | Independent code audit (8 external defect claims) | 7 confirmed → all fixed with regression coverage |
 | 2026-09-18 | Post-mortem-pattern audit (danluu catalog, ~180 incidents) | 2 serious defects fixed (poison-pill containment, Timeout×Recovery gap); 14 patterns verified addressed |
-| 2026-09-18 | Upstream circuit breaker gap (awesome-scalability rubric) | Shipped: `internal/bifrost/breaker.go` + §44 E2E |
+| 2026-09-18 | Upstream circuit breaker gap (awesome-scalability rubric) | Shipped: the breaker now in `internal/openrouter/breaker.go` + §44 E2E |
 | 2026-09-19 | Security audit remediation | All 20 confirmed findings closed; §45 E2E; one mandatory operator action (secret rotation, above) |
 | 2026-10-05 | **MASh simplification** | Agent runtime, WS transport, event bus, run idempotency and ALL non-Google auth (password/signup/recovery/mailer/JWKS) deleted; new `internal/llm` proxy + `POST /v1/chat/completions` as the single LLM endpoint; fresh migration chain (7 files); 18.1k → ~8.6k production lines; see docs/CLEANUP-2026-10-05.md |
+| 2026-11-03 | **X-Ratelimit + E2E hardening round** | `X-Ratelimit-*` admission-position headers on every chat-completions response (docs/api.md); Razorpay E2E suite (6 failure modes) + Google-OAuth E2E suite (nonce, PKCE wire, JWKS rotation, parallel flows); JWKS single-flight race fixed (concurrent first logins no longer throttle-out); full suite + `-race` green |
 | 2026-09-23 | Cleanup pass (staticcheck + deadcode + manual) | ID entropy-collapse bug fixed (duplicate ids after 436 same-ms generations pre-fix); un-wired correlation header wired; 16 dead declarations, 50 MB of run artifacts and a duplicate `migrations/` tree removed; lint + deadcode now zero |
 
 To read a full audit report: `git log --diff-filter=D --name-only -- docs/`

@@ -23,6 +23,12 @@ type Claims struct {
 	IssuedAt  time.Time // iat
 	ExpiresAt time.Time // exp
 	Method    string    // how this token was verified ("local")
+
+	// Scope separates session classes (audit M3): "web" tokens come from the
+	// browser sign-in (short TTL, no refresh) and may only reach web-safe
+	// routes; "api" (and the legacy empty scope, pre-rotation tokens) is a
+	// full desktop-device credential. Enforced by Middleware.RequireDevice.
+	Scope string // scp
 }
 
 // Identity is the server-authoritative context for one request: everything

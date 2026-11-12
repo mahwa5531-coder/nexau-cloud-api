@@ -5,6 +5,7 @@ package repos
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -140,9 +141,16 @@ func (r *SubscriptionsRepo) Effective(ctx context.Context, tenantID string) (*do
 	if err != nil {
 		return nil, err
 	}
-	// limits/models are JSONB; lenient decode — plan data is operator-authored.
+	// limits/models are JSONB. A corrupt limits blob must FAIL the load
+	// (audit H10): the old swallow served the plan with zero-value limits,
+	// and zero means UNLIMITED here — one bad JSON string silently turned a
+	// paid plan into all-you-can-eat with no error, no alert and no metric.
+	// (models stay lenient: a bad allowlist degrades to unrestricted, which
+	// is at worst a UX/entitlement-deniability question, never a cost hole.)
 	if len(limits) > 2 {
-		_ = jsonUnmarshal(limits, &s.Plan.Limits)
+		if err := jsonUnmarshal(limits, &s.Plan.Limits); err != nil {
+			return nil, fmt.Errorf("plan %s has a corrupt limits payload: %w", s.Plan.Code, err)
+		}
 	}
 	if len(models) > 2 {
 		_ = jsonUnmarshal(models, &s.Plan.Models)
@@ -167,8 +175,13 @@ func (r *SubscriptionsRepo) PlanByCode(ctx context.Context, code string) (*domai
 	if err != nil {
 		return nil, err
 	}
+	// Same fail-loud rule as Effective (audit H10): a corrupt limits blob on
+	// the FREE plan (the fallback every tenant depends on) must surface as a
+	// hard load failure, never as silent unlimited.
 	if len(limits) > 2 {
-		_ = jsonUnmarshal(limits, &p.Limits)
+		if err := jsonUnmarshal(limits, &p.Limits); err != nil {
+			return nil, fmt.Errorf("plan %s has a corrupt limits payload: %w", p.Code, err)
+		}
 	}
 	if len(models) > 2 {
 		_ = jsonUnmarshal(models, &p.Models)

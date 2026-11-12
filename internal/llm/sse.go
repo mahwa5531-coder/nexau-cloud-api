@@ -30,7 +30,9 @@ func NewSSEWriter(w http.ResponseWriter, deadline time.Duration) (*SSEWriter, er
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-cache, no-transform")
-	h.Set("Connection", "keep-alive")
+	// No Connection header (audit L20): it is hop-by-hop HTTP/1.1 vocabulary
+	// that HTTP/2 silently ignores — worse, some intermediaries treat its
+	// presence as an HTTP/1.1 signal and mishandle the stream.
 	h.Set("X-Accel-Buffering", "no") // nginx: do not buffer this response
 	w.WriteHeader(http.StatusOK)
 	f.Flush()

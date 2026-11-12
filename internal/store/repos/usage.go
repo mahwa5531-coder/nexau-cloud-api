@@ -195,3 +195,21 @@ func nullFloat(f float64) any {
 	}
 	return f
 }
+
+// PurgeOldCalls deletes llm_calls rows recorded before the cutoff, in one
+// bounded batch (audit H9). Returns the number purged; the housekeeping
+// loop calls this every tick until it stops making progress. The ctid
+// sub-select keeps the DELETE's plan index-driven instead of a full scan.
+func (r *LLMCallsRepo) PurgeOldCalls(ctx context.Context, before time.Time, batch int) (int64, error) {
+	if batch <= 0 {
+		batch = 5000
+	}
+	tag, err := r.Pool.Exec(ctx, `
+		DELETE FROM llm_calls
+		 WHERE ctid IN (SELECT ctid FROM llm_calls WHERE recorded_at < $1 LIMIT $2)`,
+		before, batch)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

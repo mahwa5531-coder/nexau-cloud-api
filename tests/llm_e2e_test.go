@@ -1,6 +1,6 @@
 // Package tests holds the integration suite for the LLM tunnel: the real
-// proxy pipeline (entitlement → quota → rate limits → Bifrost → verbatim SSE
-// passthrough → metering) against a scripted fake Bifrost, real Redis
+// proxy pipeline (entitlement → quota → rate limits → OpenRouter → verbatim
+// SSE passthrough → metering) against a scripted fake OpenRouter, real Redis
 // semantics (miniredis) and the real HTTP surface (api.Router + SSE framing).
 //
 // PostgreSQL is replaced by in-memory fakes at the repository seams;
@@ -24,17 +24,17 @@ import (
 
 	"github.com/mash-cloud/mash-api/internal/api"
 	"github.com/mash-cloud/mash-api/internal/auth"
-	"github.com/mash-cloud/mash-api/internal/bifrost"
 	"github.com/mash-cloud/mash-api/internal/config"
 	"github.com/mash-cloud/mash-api/internal/domain"
 	"github.com/mash-cloud/mash-api/internal/llm"
 	"github.com/mash-cloud/mash-api/internal/middleware"
 	"github.com/mash-cloud/mash-api/internal/observability"
+	"github.com/mash-cloud/mash-api/internal/openrouter"
 	"github.com/mash-cloud/mash-api/internal/ratelimit"
 	"github.com/mash-cloud/mash-api/internal/reqctx"
 )
 
-// ---- fake Bifrost ---------------------------------------------------------------
+// ---- fake OpenRouter ----------------------------------------------------------
 
 type scriptChunk struct {
 	data string
@@ -42,7 +42,7 @@ type scriptChunk struct {
 	delay time.Duration
 }
 
-type fakeBifrost struct {
+type fakeOpenRouter struct {
 	srv *httptest.Server
 
 	mu       sync.Mutex
@@ -52,12 +52,13 @@ type fakeBifrost struct {
 
 	script     []scriptChunk
 	scriptMode bool
-	status     int // non-2xx → error path (0 = ok)
+	status     int    // non-2xx → error path (0 = ok)
+	customBody string // non-stream body override ("" → default)
 }
 
-func newFakeBifrost(t *testing.T) *fakeBifrost {
+func newFakeOpenRouter(t *testing.T) *fakeOpenRouter {
 	t.Helper()
-	fb := &fakeBifrost{status: 0}
+	fb := &fakeOpenRouter{status: 0}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		fb.mu.Lock()
@@ -70,12 +71,19 @@ func newFakeBifrost(t *testing.T) *fakeBifrost {
 
 		if status != 0 {
 			w.WriteHeader(status)
-			_, _ = w.Write([]byte(`{"error":{"type":"upstream_error","code":"PROVIDER_500","message":"boom"}}`))
+			_, _ = w.Write([]byte(`{"error":{"code":500,"message":"boom"}}`))
 			return
 		}
 		if !scriptMode {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"cc_1","object":"chat.completion","created":1,"model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}`))
+			body := `{"id":"cc_1","object":"chat.completion","created":1,"model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}`
+			fb.mu.Lock()
+			custom := fb.customBody
+			fb.mu.Unlock()
+			if custom != "" {
+				body = custom
+			}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -107,7 +115,7 @@ func readBody(r *http.Request) string {
 	return string(b)
 }
 
-func (fb *fakeBifrost) setScript(chunks ...scriptChunk) {
+func (fb *fakeOpenRouter) setScript(chunks ...scriptChunk) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	fb.scriptMode = true
@@ -115,20 +123,28 @@ func (fb *fakeBifrost) setScript(chunks ...scriptChunk) {
 	fb.status = 0
 }
 
-func (fb *fakeBifrost) setNonStream(status int) {
+func (fb *fakeOpenRouter) setNonStream(status int) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	fb.scriptMode = false
 	fb.status = status
 }
 
-func (fb *fakeBifrost) requestCount() int {
+func (fb *fakeOpenRouter) setNonStreamBody(body string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.scriptMode = false
+	fb.status = 0
+	fb.customBody = body
+}
+
+func (fb *fakeOpenRouter) requestCount() int {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	return fb.requests
 }
 
-func (fb *fakeBifrost) wasCanceled() bool {
+func (fb *fakeOpenRouter) wasCanceled() bool {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	return fb.canceled
@@ -215,7 +231,7 @@ func testIdentity() *auth.Identity {
 }
 
 type env struct {
-	fb       *fakeBifrost
+	fb       *fakeOpenRouter
 	mr       *miniredis.Miniredis
 	recorder *fakeRecorder
 	usage    *fakeUsageQuery
@@ -229,15 +245,15 @@ func newEnv(t *testing.T) *env {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	fb := newFakeBifrost(t)
+	fb := newFakeOpenRouter(t)
 	metrics := observability.NewMetrics()
 	limiter := ratelimit.New(rdb, true, metrics)
 	recorder := &fakeRecorder{}
 	usage := &fakeUsageQuery{used: map[string]int64{}, weekly: map[string]int64{}}
 
-	bfClient := bifrost.NewClient(bifrost.TransportConfig{BaseURL: fb.srv.URL}, metrics)
+	orClient := openrouter.NewClient(openrouter.TransportConfig{BaseURL: fb.srv.URL, APIKey: "sk-or-v1-test"}, metrics)
 	proxy := &llm.Proxy{
-		Bifrost: bfClient, Meter: recorder, Limiter: limiter, Usage: usage, Metrics: metrics,
+		Upstream: orClient, Meter: recorder, Limiter: limiter, Usage: usage, Metrics: metrics,
 		Redis: rdb, UsageCacheTTL: 5 * time.Second,
 		Limits: llm.Limits{MaxMessages: 32, MaxTools: 16, MaxModelLen: 128},
 		Rate:   llm.RateRules{RPMUser: 600, RPMTenant: 6000, ConcUser: 16, ConcTenant: 256},
@@ -254,7 +270,7 @@ func sampleRequest(stream bool) *llm.Request {
 	return &llm.Request{
 		Model:  "openai/gpt-4o",
 		Stream: stream,
-		Messages: []bifrost.Message{
+		Messages: []openrouter.Message{
 			{Role: "user", Content: json.RawMessage(`"hi"`)},
 		},
 	}
@@ -309,12 +325,12 @@ func TestStreamHappyPathForwardsVerbatimAndMeters(t *testing.T) {
 	env.fb.setScript(
 		chunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"he"}}]}`),
 		chunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"llo"}}]}`),
-		finalChunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":{"total_cost":0.0004}},"extra_fields":{"provider":"openai","resolved_model_used":"openai/gpt-4o"}}`),
+		finalChunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","provider":"openai","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.0004,"cost_details":{"upstream_inference_prompt_cost":0.0003,"upstream_inference_completions_cost":0.0001,"upstream_inference_cost":0.0004}}}`),
 	)
 
 	sink := &captureSink{}
 	ctx := reqctx.WithRequestID(context.Background(), "req_test_1")
-	derr := env.proxy.Stream(ctx, idn, sampleRequest(true), sink)
+	_, derr := env.proxy.Stream(ctx, idn, sampleRequest(true), sink)
 	if derr != nil {
 		t.Fatalf("stream: %v", derr)
 	}
@@ -353,7 +369,7 @@ func TestNonStreamHappyPathReturnsBodyAndMeters(t *testing.T) {
 	idn := testIdentity()
 	env.fb.setNonStream(0)
 
-	body, derr := env.proxy.Complete(context.Background(), idn, sampleRequest(false))
+	body, _, derr := env.proxy.Complete(context.Background(), idn, sampleRequest(false))
 	if derr != nil {
 		t.Fatalf("complete: %v", derr)
 	}
@@ -382,7 +398,7 @@ func TestQuotaGateBlocksAtConsumptionPoint(t *testing.T) {
 	recovery := time.Now().UTC().Add(2 * time.Hour)
 	env.usage.recovers = map[string]time.Time{"ten_t1": recovery}
 
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
 	if derr == nil || derr.Code != "WINDOW_QUOTA_EXCEEDED" {
 		t.Fatalf("want WINDOW_QUOTA_EXCEEDED, got %v", derr)
 	}
@@ -399,12 +415,22 @@ func TestQuotaGateBlocksAtConsumptionPoint(t *testing.T) {
 		t.Fatal("blocked calls must not be metered")
 	}
 
-	// One token under quota: admitted (the gate is >=, matching the display's
-	// "100% exactly when rejected").
+	// With admission-time reservation (audit H2) the gate rejects when the
+	// PROJECTED usage crosses the limit: one token under a 1000 budget no
+	// longer admits a call whose estimate alone is ~2048 — that is the
+	// bounded-overshoot guarantee replacing the old "starts under quota,
+	// finishes over" behaviour.
 	env.usage.set("ten_t1", 999)
 	env.fb.setScript(chunk(`{"id":"c","object":"chat.completion.chunk","model":"m","choices":[]}`))
-	if derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
-		t.Fatalf("under quota must pass: %v", derr)
+	if _, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr == nil {
+		t.Fatal("one token under a 1000 budget must reject a 2048-token projection")
+	}
+
+	// Under quota WITH room for the projection: admitted.
+	idn.Limits.Window5hTokens = 100_000
+	env.usage.set("ten_t1", 100)
+	if _, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
+		t.Fatalf("under quota with projection room must pass: %v", derr)
 	}
 }
 
@@ -418,7 +444,7 @@ func TestWeeklyWindowBlocksIndependently(t *testing.T) {
 	env.usage.set("ten_t1", 100)        // 5h: fine
 	env.usage.setWeekly("ten_t1", 5000) // weekly: at quota
 
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
 	if derr == nil || derr.Code != "WINDOW_QUOTA_EXCEEDED" {
 		t.Fatalf("want WINDOW_QUOTA_EXCEEDED, got %v", derr)
 	}
@@ -443,11 +469,11 @@ func TestNormalizationWeightsDriveMetering(t *testing.T) {
 
 	env.fb.setScript(
 		chunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"h"}}]}`),
-		finalChunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_read_tokens":20,"cached_write_tokens":10},"cost":{"total_cost":0.002}}}`),
+		finalChunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","provider":"openai","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":20,"cache_write_tokens":10},"cost":0.002}}`),
 	)
 
 	sink := &captureSink{}
-	if derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink); derr != nil {
+	if _, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink); derr != nil {
 		t.Fatalf("stream: %v", derr)
 	}
 	calls := env.recorder.recorded()
@@ -477,9 +503,9 @@ func TestNormalizationWeightsDriveMetering(t *testing.T) {
 // at zero (never negative, never free below zero), and the default rule gives
 // the classic accounting (cache free, total = input + output).
 func TestNormalizationFloorAndDefault(t *testing.T) {
-	weird := &bifrost.Usage{
+	weird := &openrouter.Usage{
 		PromptTokens: 30, CompletionTokens: 7, TotalTokens: 37,
-		PromptTokensDetails: &bifrost.PromptTokensDetails{CachedReadTokens: 50},
+		PromptTokensDetails: &openrouter.PromptTokensDetails{CachedReadTokens: 50},
 	}
 	got := llm.NormalizeUsage(weird, domain.DefaultNormRule)
 	if got.InputTokens != 0 || got.OutputTokens != 7 || got.TotalTokens != 7 {
@@ -489,7 +515,7 @@ func TestNormalizationFloorAndDefault(t *testing.T) {
 		t.Fatalf("raw prompt: %+v", got)
 	}
 
-	plain := &bifrost.Usage{PromptTokens: 12, CompletionTokens: 5, TotalTokens: 17}
+	plain := &openrouter.Usage{PromptTokens: 12, CompletionTokens: 5, TotalTokens: 17}
 	got2 := llm.NormalizeUsage(plain, domain.DefaultNormRule)
 	if got2.InputTokens != 12 || got2.OutputTokens != 5 || got2.TotalTokens != 17 {
 		t.Fatalf("default rule usage: %+v", got2)
@@ -510,7 +536,7 @@ func TestModelEntitlementBlocksOffAllowlist(t *testing.T) {
 	idn.Restricted = true
 	idn.Models = []string{"anthropic/*"}
 
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
 	if derr == nil || derr.Code != "MODEL_NOT_ENTITLED" {
 		t.Fatalf("want MODEL_NOT_ENTITLED, got %v", derr)
 	}
@@ -519,7 +545,7 @@ func TestModelEntitlementBlocksOffAllowlist(t *testing.T) {
 	req := sampleRequest(true)
 	req.Model = "anthropic/claude-3-5-sonnet"
 	env.fb.setScript(chunk(`{"id":"c","object":"chat.completion.chunk","model":"m","choices":[]}`))
-	if derr := env.proxy.Stream(context.Background(), idn, req, &captureSink{}); derr != nil {
+	if _, derr := env.proxy.Stream(context.Background(), idn, req, &captureSink{}); derr != nil {
 		t.Fatalf("allowlisted model must pass: %v", derr)
 	}
 
@@ -527,7 +553,7 @@ func TestModelEntitlementBlocksOffAllowlist(t *testing.T) {
 	req2 := sampleRequest(true)
 	req2.Model = "anthropic/claude-3-5-sonnet"
 	req2.Fallbacks = []string{"openai/gpt-4o"}
-	if derr := env.proxy.Stream(context.Background(), idn, req2, &captureSink{}); derr == nil || derr.Code != "MODEL_NOT_ENTITLED" {
+	if _, derr := env.proxy.Stream(context.Background(), idn, req2, &captureSink{}); derr == nil || derr.Code != "MODEL_NOT_ENTITLED" {
 		t.Fatalf("fallback bypass must be blocked, got %v", derr)
 	}
 }
@@ -537,7 +563,7 @@ func TestSubscriptionInactiveBlocks(t *testing.T) {
 	idn := testIdentity()
 	idn.SubscriptionStatus = "canceled"
 
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
 	if derr == nil || derr.Code != "SUBSCRIPTION_INACTIVE" {
 		t.Fatalf("want SUBSCRIPTION_INACTIVE, got %v", derr)
 	}
@@ -555,14 +581,14 @@ func TestFreePlanAllowsPermittedModelsAndBlocksProModels(t *testing.T) {
 	env.fb.setScript(chunk(`{"id":"c","object":"chat.completion.chunk","model":"openai/gpt-6-luna","choices":[]}`))
 	reqAllowed := sampleRequest(true)
 	reqAllowed.Model = "openai/gpt-6-luna"
-	if derr := env.proxy.Stream(context.Background(), idn, reqAllowed, &captureSink{}); derr != nil {
+	if _, derr := env.proxy.Stream(context.Background(), idn, reqAllowed, &captureSink{}); derr != nil {
 		t.Fatalf("free model on free plan must succeed, got %v", derr)
 	}
 
 	// 2. Pro frontier model returns MODEL_NOT_ENTITLED (prompting upgrade)
 	reqPro := sampleRequest(true)
 	reqPro.Model = "anthropic/claude-sonnet-5.5"
-	derr := env.proxy.Stream(context.Background(), idn, reqPro, &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, reqPro, &captureSink{})
 	if derr == nil || derr.Code != "MODEL_NOT_ENTITLED" {
 		t.Fatalf("pro model on free plan must be MODEL_NOT_ENTITLED, got %v", derr)
 	}
@@ -575,12 +601,12 @@ func TestRPMLimitBlocksBeforeUpstream(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		env.fb.setScript(chunk(`{"id":"c","object":"chat.completion.chunk","model":"m","choices":[]}`))
-		if derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
+		if _, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
 			t.Fatalf("call %d: %v", i, derr)
 		}
 	}
 	env.fb.setScript(chunk(`{"id":"c","object":"chat.completion.chunk","model":"m","choices":[]}`))
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
 	if derr == nil || derr.Code != "RATE_LIMITED" {
 		t.Fatalf("want RATE_LIMITED, got %v", derr)
 	}
@@ -606,7 +632,7 @@ func TestConcurrencyLimitBlocksAndReleases(t *testing.T) {
 	unblock := make(chan struct{})
 	sink := &blockingSink{unblock: unblock}
 	go func() {
-		_ = env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
+		_, _ = env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
 	}()
 
 	// Wait until the first stream reached the upstream (slot held).
@@ -618,7 +644,7 @@ func TestConcurrencyLimitBlocksAndReleases(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
 	if derr == nil || derr.Code != "CONCURRENCY_LIMIT" {
 		t.Fatalf("want CONCURRENCY_LIMIT, got %v", derr)
 	}
@@ -633,7 +659,7 @@ func TestConcurrencyLimitBlocksAndReleases(t *testing.T) {
 	}
 	// The slot must be free again: the next call passes the concurrency gate.
 	env.fb.setScript(chunk(`{"id":"c2","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
-	if derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
+	if _, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
 		t.Fatalf("slot not released after stream end: %v", derr)
 	}
 }
@@ -672,7 +698,7 @@ func TestClientDisconnectCancelsUpstreamAndMetersCancelled(t *testing.T) {
 		cancel() // client disconnects
 	}()
 
-	derr := env.proxy.Stream(ctx, idn, sampleRequest(true), sink)
+	_, derr := env.proxy.Stream(ctx, idn, sampleRequest(true), sink)
 	if derr != nil {
 		t.Fatalf("client disconnect must not surface as an upstream error: %v", derr)
 	}
@@ -703,7 +729,7 @@ func TestUpstreamPreStreamFailureIsHTTPError(t *testing.T) {
 	env.fb.setNonStream(500)
 
 	sink := &captureSink{}
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
 	if derr == nil {
 		t.Fatal("upstream 500 must surface")
 	}
@@ -737,10 +763,10 @@ func TestUpstreamMidStreamFailureEmitsInBandError(t *testing.T) {
 	defer trunc.Close()
 
 	metrics := observability.NewMetrics()
-	env.proxy.Bifrost = bifrost.NewClient(bifrost.TransportConfig{BaseURL: trunc.URL}, metrics)
+	env.proxy.Upstream = openrouter.NewClient(openrouter.TransportConfig{BaseURL: trunc.URL, APIKey: "sk-or-v1-test"}, metrics)
 
 	sink := &captureSink{}
-	derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
 	if derr == nil {
 		t.Fatal("mid-stream truncation must fail")
 	}
@@ -765,14 +791,14 @@ func TestValidationRejectsBadPayloads(t *testing.T) {
 		req  *llm.Request
 		want string
 	}{
-		{"no model", &llm.Request{Model: "", Messages: []bifrost.Message{{Role: "user", Content: json.RawMessage(`"x"`)}}}, "model is required"},
-		{"bare model", &llm.Request{Model: "gpt-4o", Messages: []bifrost.Message{{Role: "user", Content: json.RawMessage(`"x"`)}}}, `model must be "provider/model"`},
+		{"no model", &llm.Request{Model: "", Messages: []openrouter.Message{{Role: "user", Content: json.RawMessage(`"x"`)}}}, "model is required"},
+		{"bare model", &llm.Request{Model: "gpt-4o", Messages: []openrouter.Message{{Role: "user", Content: json.RawMessage(`"x"`)}}}, `model must be "provider/model"`},
 		{"no messages", &llm.Request{Model: "openai/gpt-4o"}, "messages must not be empty"},
-		{"bad role", &llm.Request{Model: "openai/gpt-4o", Messages: []bifrost.Message{{Role: "wizard", Content: json.RawMessage(`"x"`)}}}, "invalid role"},
-		{"bad temperature", &llm.Request{Model: "openai/gpt-4o", Messages: []bifrost.Message{{Role: "user", Content: json.RawMessage(`"x"`)}}, Temperature: f64p(3)}, "temperature"},
+		{"bad role", &llm.Request{Model: "openai/gpt-4o", Messages: []openrouter.Message{{Role: "wizard", Content: json.RawMessage(`"x"`)}}}, "invalid role"},
+		{"bad temperature", &llm.Request{Model: "openai/gpt-4o", Messages: []openrouter.Message{{Role: "user", Content: json.RawMessage(`"x"`)}}, Temperature: f64p(3)}, "temperature"},
 	}
 	for _, tc := range cases {
-		derr := env.proxy.Stream(context.Background(), idn, tc.req, &captureSink{})
+		_, derr := env.proxy.Stream(context.Background(), idn, tc.req, &captureSink{})
 		if derr == nil || !strings.Contains(derr.Message, tc.want) {
 			t.Fatalf("%s: want %q, got %v", tc.name, tc.want, derr)
 		}
@@ -878,5 +904,224 @@ func TestHTTPEndpointSSEFramingAndAuth(t *testing.T) {
 	_ = resp2.Body.Close()
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("old agent route must 404, got %d", resp2.StatusCode)
+	}
+}
+
+// ---- audit H2: admission-time quota reservation -----------------------------------
+
+// TestQuotaReservationBlocksSecondInFlightCall is the H2 end-to-end
+// regression: two calls whose ESTIMATES together cross the budget cannot both
+// be in flight, even though the database still reports zero usage (the old
+// gate admitted any number of them — the overshoot scaled with the fan-out).
+func TestQuotaReservationBlocksSecondInFlightCall(t *testing.T) {
+	env := newEnv(t)
+	idn := testIdentity()
+	idn.Limits.Window5hTokens = 3000 // one estimate (2048) fits, two do not
+	idn.Limits.WindowWeeklyTokens = 1_000_000
+
+	// A stream that stays in flight for a while (reservation must be held
+	// for the whole call, not just the admission instant).
+	env.fb.setScript(
+		chunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"h"}}]}`),
+		scriptChunk{data: `{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}`, delay: 400 * time.Millisecond},
+	)
+
+	// First call: admitted, holds a ~2048-token reservation while streaming.
+	first := make(chan *domain.Error, 1)
+	go func() {
+		_, de := env.proxy.Stream(reqctx.WithRequestID(context.Background(), "req_h2_1"), idn, sampleRequest(true), &captureSink{})
+		first <- de
+	}()
+	waitFor(t, "first call in flight", 2*time.Second, func() bool {
+		return env.proxy.ActiveCount() == 1
+	})
+
+	// Second call while the first is still streaming: projected usage
+	// (0 used + 2048 reserved + 2048 estimate) crosses the 3000 budget.
+	_, derr := env.proxy.Stream(reqctx.WithRequestID(context.Background(), "req_h2_2"), idn, sampleRequest(true), &captureSink{})
+	if derr == nil || derr.Code != "WINDOW_QUOTA_EXCEEDED" {
+		t.Fatalf("second in-flight call must be quota-rejected, got %v", derr)
+	}
+	if derr.Details["window"] != "5h" {
+		t.Fatalf("binding window: %v", derr.Details["window"])
+	}
+
+	// The first stream completes fine.
+	if err := <-first; err != nil {
+		t.Fatalf("first stream: %v", err)
+	}
+
+	// After completion the reservation was reconciled to the ACTUAL usage
+	// (12 tokens) — a fresh call fits again (12 + 2048 ≤ 3000).
+	env.fb.setScript(
+		chunk(`{"id":"c2","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"x"}}]}`),
+		finalChunk(`{"id":"c2","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}`),
+	)
+	if _, derr := env.proxy.Stream(reqctx.WithRequestID(context.Background(), "req_h2_3"), idn, sampleRequest(true), &captureSink{}); derr != nil {
+		t.Fatalf("post-completion call must be admitted (reservation reconciled), got %v", derr)
+	}
+}
+
+// waitFor polls for a condition up to the deadline.
+func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// ---- audit M6: metering weights follow the resolved model -------------------------
+
+type fakeRuleSource struct{}
+
+func (fakeRuleSource) All(_ context.Context) ([]domain.NormRule, error) {
+	return []domain.NormRule{
+		{Model: "openai/heavy", InputWeight: 10, OutputWeight: 10, CachedReadWeight: 1, CachedWriteWeight: 1},
+	}, nil
+}
+
+// TestStreamUsageWeightFollowsResolvedModel is the M6 regression: when the
+// model swap and the usage counts arrive in the SAME chunk (mid-stream
+// fallback, early usage reporting), the metering weights must be the NEW
+// model's. The old order normalized against the previous chunk's model.
+func TestStreamUsageWeightFollowsResolvedModel(t *testing.T) {
+	env := newEnv(t)
+	idn := testIdentity()
+	env.proxy.Norm = llm.NewRuleCache(fakeRuleSource{}, time.Minute)
+
+	// One chunk carrying BOTH the resolved model and the usage: prompt 100,
+	// completion 50 — heavy weights (10×) must apply: 1000 in / 500 out.
+	env.fb.setScript(
+		chunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"hi"}}]}`),
+		finalChunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/heavy","provider":"openai","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"cost":0.009}}`),
+	)
+
+	if _, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{}); derr != nil {
+		t.Fatalf("stream: %v", derr)
+	}
+	calls := env.recorder.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("metered calls: %d", len(calls))
+	}
+	c := calls[0]
+	if c.ResolvedModel != "openai/heavy" {
+		t.Fatalf("resolved model: %q", c.ResolvedModel)
+	}
+	if c.Usage.InputTokens != 1000 || c.Usage.OutputTokens != 500 || c.Usage.TotalTokens != 1500 {
+		t.Fatalf("M6 regression: usage metered with the wrong weights: %+v (want 1000/500/1500)", c.Usage)
+	}
+	// Raw provider numbers stay untouched for reconstruction.
+	if c.Usage.RawPromptTokens != 100 || c.Usage.RawCompletionTokens != 50 {
+		t.Fatalf("raw usage must be preserved: %+v", c.Usage)
+	}
+}
+
+// ---- audit L5: empty stream must be a clean 200, not a 500 -----------------------
+
+func TestEmptyUpstreamStreamIsCleanSSE(t *testing.T) {
+	env := newEnv(t)
+	idn := testIdentity()
+
+	// Upstream answers with zero data chunks, straight to [DONE].
+	env.fb.setScript()
+
+	sink := &captureSink{}
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
+	if derr != nil {
+		t.Fatalf("empty stream must not error: %v", derr)
+	}
+	if sink.Started() {
+		t.Fatalf("no bytes should be forwarded for an empty answer")
+	}
+	calls := env.recorder.recorded()
+	if len(calls) != 1 || calls[0].Status != domain.CallCompleted {
+		t.Fatalf("empty answer is a completed call: %+v", calls)
+	}
+}
+
+// ---- audit M9: shutdown ends streams gracefully -----------------------------------
+
+func TestShutdownEndsInFlightStreamGracefully(t *testing.T) {
+	env := newEnv(t)
+	idn := testIdentity()
+
+	// A stream that has forwarded one chunk and is waiting on the next.
+	env.fb.setScript(
+		chunk(`{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"delta":{"content":"par"}}]}`),
+		scriptChunk{data: `{"id":"c1","object":"chat.completion.chunk","model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop"}]}`, delay: 2 * time.Second},
+	)
+
+	sink := &captureSink{}
+	done := make(chan *domain.Error, 1)
+	go func() {
+		_, de := env.proxy.Stream(context.Background(), idn, sampleRequest(true), sink)
+		done <- de
+	}()
+	waitFor(t, "stream in flight", 2*time.Second, func() bool {
+		return env.proxy.ActiveCount() == 1 && len(sink.chunkList()) == 1
+	})
+
+	// SIGTERM equivalent.
+	env.proxy.BeginShutdown()
+
+	select {
+	case derr := <-done:
+		if derr != nil {
+			t.Fatalf("shutdown-ended stream must return cleanly (in-band event), got %v", derr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not end after shutdown broadcast")
+	}
+
+	// The client saw an in-band OpenAI-style error event, not a bare close.
+	if sink.errEvent != "SERVER_SHUTDOWN" {
+		t.Fatalf("in-band error event: %q, want SERVER_SHUTDOWN", sink.errEvent)
+	}
+	// Metering tells the truth about why the stream ended.
+	calls := env.recorder.recorded()
+	if len(calls) != 1 || calls[0].ErrorCode != "SERVER_SHUTDOWN" {
+		t.Fatalf("metered end reason: %+v", calls)
+	}
+	// New admissions during drain are refused with a retryable 503.
+	_, derr := env.proxy.Stream(context.Background(), idn, sampleRequest(true), &captureSink{})
+	if derr == nil || derr.Code != "SERVER_SHUTDOWN" || derr.HTTP != http.StatusServiceUnavailable {
+		t.Fatalf("post-shutdown admission: %v", derr)
+	}
+}
+
+// ---- audit M10: non-stream verbatim passthrough ------------------------------------
+
+func TestNonStreamForwardsUnknownFieldsVerbatim(t *testing.T) {
+	env := newEnv(t)
+	idn := testIdentity()
+
+	// A future upstream field the struct does not know (e.g. an
+	// OpenRouter-style annotation). It must survive the tunnel.
+	env.fb.setNonStreamBody(`{"id":"cc_9","object":"chat.completion","created":1,"model":"openai/gpt-4o","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11},"reasoning_summary":"because","vendor_annotation":{"cache_hit":true}}`)
+
+	body, _, derr := env.proxy.Complete(context.Background(), idn, sampleRequest(false))
+	if derr != nil {
+		t.Fatalf("complete: %v", derr)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	if parsed["reasoning_summary"] != "because" {
+		t.Fatalf("M10 regression: unknown top-level field dropped: %s", body)
+	}
+	ann, _ := parsed["vendor_annotation"].(map[string]any)
+	if ann == nil || ann["cache_hit"] != true {
+		t.Fatalf("M10 regression: unknown nested field dropped: %s", body)
+	}
+	// Known fields still meter correctly.
+	calls := env.recorder.recorded()
+	if len(calls) != 1 || calls[0].Usage.TotalTokens != 11 {
+		t.Fatalf("metering after verbatim path: %+v", calls)
 	}
 }

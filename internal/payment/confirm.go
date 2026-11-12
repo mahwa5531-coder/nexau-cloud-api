@@ -3,6 +3,8 @@ package payment
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
 )
 
 // Confirm verifies the client checkout handshake and activates the plan.
@@ -28,6 +30,15 @@ import (
 func (s *Service) Confirm(ctx context.Context, tenantID, providerOrderID, providerPaymentID, signature string) (*Order, error) {
 	if !s.Enabled() {
 		return nil, ErrDisabled
+	}
+	// Bounded provider fan-out (audit H6): confirm's provider fetch is
+	// metered; share GetOrder's per-tenant minute budget so a scripted
+	// confirm/status loop cannot become a provider bill.
+	if s.lim != nil && s.cfg.ReconcilePerTenant > 0 {
+		if !s.lim.Admit(ctx, "pay:reconcile:"+tenantID, time.Minute,
+			s.cfg.ReconcilePerTenant, fmt.Sprintf("cf-%d", time.Now().UnixNano())) {
+			return nil, ErrReconcileBudget()
+		}
 	}
 	o, err := s.store.OrderByProviderID(ctx, s.provider.Name(), providerOrderID)
 	if err != nil {

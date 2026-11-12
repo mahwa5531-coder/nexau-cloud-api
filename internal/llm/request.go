@@ -1,5 +1,5 @@
 // Package llm is the model-request proxy: the single LLM surface between the
-// desktop agent runtime and the private Bifrost gateway.
+// desktop agent runtime and OpenRouter (direct upstream).
 //
 // The desktop owns the entire agent runtime (sessions, transcripts, tools,
 // retry policy, state). This layer does exactly four things per request:
@@ -16,9 +16,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mash-cloud/mash-api/internal/bifrost"
 	"github.com/mash-cloud/mash-api/internal/domain"
 	"github.com/mash-cloud/mash-api/internal/ids"
+	"github.com/mash-cloud/mash-api/internal/openrouter"
 )
 
 // Limits carries the validation bounds (from config, plan-enforced).
@@ -32,13 +32,13 @@ type Limits struct {
 // request the MASh desktop runtime produces, plus nothing else. Correlation
 // lives in headers (x-request-id), not the body.
 type Request struct {
-	Model    string            `json:"model"`
-	Messages []bifrost.Message `json:"messages"`
-	Stream   bool              `json:"stream,omitempty"`
+	Model    string               `json:"model"`
+	Messages []openrouter.Message `json:"messages"`
+	Stream   bool                 `json:"stream,omitempty"`
 
 	// Tools.
-	Tools      []bifrost.Tool  `json:"tools,omitempty"`
-	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+	Tools      []openrouter.Tool `json:"tools,omitempty"`
+	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
 
 	// Generation parameters (validated subset, forwarded).
 	Temperature         *float64           `json:"temperature,omitempty"`
@@ -115,13 +115,15 @@ func (r *Request) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// ToBifrost converts the validated request into the upstream shape.
-func (r *Request) ToBifrost() *bifrost.ChatRequest {
-	req := &bifrost.ChatRequest{
+// ToUpstream converts the validated request into the OpenRouter shape.
+// Our validated per-request model fallbacks map onto OpenRouter's ordered
+// `models` list (tried after the primary `model`).
+func (r *Request) ToUpstream() *openrouter.ChatRequest {
+	req := &openrouter.ChatRequest{
 		Model:               r.Model,
 		Messages:            r.Messages,
 		Stream:              r.Stream,
-		Fallbacks:           r.Fallbacks,
+		Models:              r.Fallbacks,
 		Temperature:         r.Temperature,
 		TopP:                r.TopP,
 		MaxCompletionTokens: r.MaxCompletionTokens,
@@ -141,13 +143,10 @@ func (r *Request) ToBifrost() *bifrost.ChatRequest {
 		Extras:              r.Extras,
 	}
 	if r.ReasoningEffort != "" {
-		req.Reasoning = &bifrost.Reasoning{Effort: r.ReasoningEffort}
+		req.Reasoning = &openrouter.Reasoning{Effort: r.ReasoningEffort}
 	}
-	if r.Stream {
-		// Bifrost standardization puts usage in the LAST chunk only when
-		// include_usage is requested — authoritative metering depends on it.
-		req.StreamOptions = &bifrost.StreamOptions{IncludeUsage: true}
-	}
+	// stream_options.include_usage is not sent: OpenRouter deprecated it
+	// (no effect) and always returns full usage in the final chunk.
 	return req
 }
 
@@ -162,7 +161,7 @@ func (r *Request) Validate(l Limits) *domain.Error {
 	if r.Model == "mash" || r.Model == "auto" || r.Model == "default" {
 		r.Model = "mash/auto"
 	}
-	// Model: "provider/model" shape (Bifrost routing), bounded length, safe charset.
+	// Model: "vendor/model" OpenRouter slug, bounded length, safe charset.
 	if r.Model == "" {
 		return domain.ErrValidation("model is required")
 	}

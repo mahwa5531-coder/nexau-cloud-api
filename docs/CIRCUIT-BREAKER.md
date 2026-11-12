@@ -1,6 +1,8 @@
-# Upstream Circuit Breaker — Bifrost Path
+# Upstream Circuit Breaker — OpenRouter Path
 
-**Status:** implemented and verified · **Scope:** `internal/bifrost` · **Spec:** validation §44
+**Status:** implemented and verified · **Scope:** `internal/openrouter` · **Spec:** validation §44
+**Upstream note:** the breaker predates the direct-OpenRouter switch (2026-11-03)
+and carried over unchanged — it protects any single HTTP upstream.
 **Added:** 2026-09-18 · **Motivation:** the last genuine gap from the
 `awesome-scalability` Stability catalog audit (Task 22) — and the catalog's own
 #1 pattern (Heroku, Shopify, Trivago, Zendek case studies): *stop hammering a
@@ -10,12 +12,12 @@ failing dependency; fail fast; recover automatically.*
 
 ## 1. What problem this solves
 
-Before the breaker, a sustained Bifrost outage meant every LLM request burned
+Before the breaker, a sustained upstream outage meant every LLM request burned
 its full budget upstream: dial timeout (10 s) or HTTP 503, times the bounded
 retry policy (2 retries with backoff), for **every** request, for the entire
 outage. The API stayed alive (panic containment, watchdogs, bounded pools all
 predate this), but it paid the maximum latency and socket cost per request
-and amplified load against a struggling gateway — the classic retry-storm
+and amplified load against a struggling upstream — the classic retry-storm
 anti-pattern the awesome-scalability catalog documents across Heroku, Shopify
 and SoundCloud incidents.
 
@@ -27,25 +29,25 @@ upstream LLM call only.
 
 ## 2. Failure model — what counts as a "gateway fault"
 
-The breaker protects against **gateway death/flapping**, not provider quality:
+The breaker protects against **upstream death/flapping**, not provider quality:
 
 | Outcome | Recorded as | Rationale |
 |---|---|---|
-| Network error before response headers (dial fail, reset, timeout) | **failure** | gateway unreachable |
-| HTTP 5xx status | **failure** | gateway sick |
-| HTTP 408 | **failure** | gateway timed out the request |
-| Mid-stream termination without `[DONE]` | **failure** | gateway dropped the connection |
-| Mid-stream idle-watchdog abort (`MODEL_TIMEOUT` stream-idle) | **failure** | gateway stalled |
+| Network error before response headers (dial fail, reset, timeout) | **failure** | upstream unreachable |
+| HTTP 5xx status | **failure** | upstream sick |
+| HTTP 408 | **failure** | upstream timed out the request |
+| Mid-stream termination without `[DONE]` | **failure** | upstream dropped the connection |
+| Mid-stream idle-watchdog abort (`MODEL_TIMEOUT` stream-idle) | **failure** | upstream stalled |
 | Non-JSON SSE data line / oversized SSE line | **failure** | protocol-broken upstream |
-| HTTP 2xx response headers received | **success** | gateway alive (2xx headers = liveness proof) |
-| HTTP 4xx other than 408 (400/401/403/404/409/429) | **success** | gateway alive and answering |
-| In-band `BifrostError` riding a 200 SSE stream | *ignored* | provider problem on a live gateway |
+| HTTP 2xx response headers received | **success** | upstream alive (2xx headers = liveness proof) |
+| HTTP 4xx other than 408 (400/401/403/404/409/429) | **success** | upstream alive and answering |
+| In-band error object riding a 200 SSE stream | *ignored* | provider problem on a live upstream |
 | Client cancellation / caller budget exhausted (`ctx` done) | *ignored* | not the gateway's fault |
-| `GET /health` probe results | *ignored* | readiness is a separate concern |
+| `GET /v1/key` probe results | *ignored* | readiness is a separate concern |
 
 Recording happens **per upstream attempt** (so our own bounded retries make
 the breaker more sensitive, matching Envoy's per-attempt semantics) and at the
-**exact classification sites** in `internal/bifrost/stream.go` — never by
+**exact classification sites** in `internal/openrouter/stream.go` — never by
 string-matching error codes.
 
 ## 3. State machine
@@ -69,7 +71,7 @@ string-matching error codes.
   * *rate*: failure fraction over the last `WindowSize` outcomes (default 60)
     `≥ FailureRate` (default 0.60) once at least `MinSamples` (default 30)
     exist. Evaluated when failures arrive — a success never trips on the past.
-    This mode catches a *flapping* gateway that interleaves 200-headers with
+    This mode catches a *flapping* upstream that interleaves 200-headers with
     mid-stream drops.
 * **OPEN** — every `Completion`/`CompletionStream` call fast-fails with
   503 `UPSTREAM_CIRCUIT_OPEN` (`details.retryable=true`,
@@ -88,49 +90,49 @@ string-matching error codes.
 
 State is **per process (per replica)** — each replica trips and recovers
 independently, the standard in-process-breaker deployment shape. One breaker
-per `bifrost.Client`, and the client is a process-wide singleton, so it is
+per `openrouter.Client`, and the client is a process-wide singleton, so it is
 effectively per-upstream-host.
 
 ## 4. Where it hooks into the code
 
 | Concern | Location |
 |---|---|
-| Gate (fast-fail before any work) | `internal/bifrost/client.go` — `gate()` at the top of `Completion` and `CompletionStream` |
+| Gate (fast-fail before any work) | `internal/openrouter/client.go` — `gate()` at the top of `Completion` and `CompletionStream` |
 | Per-attempt recording | the `withRetry` closures in `client.go` (post error / error status / 2xx headers) |
-| Mid-stream fault recording | `internal/bifrost/stream.go` — `cbFail()` / `cbOnTimeout()` at the exact terminal-error classification sites |
-| State + transitions + backoff + ring | `internal/bifrost/breaker.go` (mutex-guarded, injectable clock for tests) |
+| Mid-stream fault recording | `internal/openrouter/stream.go` — `cbFail()` / `cbOnTimeout()` at the exact terminal-error classification sites |
+| State + transitions + backoff + ring | `internal/openrouter/breaker.go` (mutex-guarded, injectable clock for tests) |
 | Metrics | `internal/observability/metrics.go` (see §5) |
-| Readiness reporting (informational) | `internal/api/health.go` — `bifrost_circuit` field; **never** gates readiness |
-| Config | `internal/config/config.go` (`BifrostConfig.CB*`, env `NEXAU_BIFROST_CB_*`, all in `.env.example`) |
-| Wiring | `cmd/server/main.go` maps config into `bifrost.TransportConfig.CircuitBreaker` |
+| Readiness reporting (informational) | `internal/api/health.go` — `upstream_circuit` field; **never** gates readiness |
+| Config | `internal/config/config.go` (`OpenRouterConfig.CB*`, env `NEXAU_OPENROUTER_CB_*`) |
+| Wiring | `cmd/server/main.go` maps config into `openrouter.TransportConfig.CircuitBreaker` |
 
 `Health()` deliberately **bypasses** the breaker: a tripped breaker must not
-darken the readiness probe, and a healthy `/health` must not close a tripped
-breaker.
+darken the readiness probe, and a healthy `GET /v1/key` must not close a
+tripped breaker.
 
 ## 5. Observability
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `nexau_bifrost_breaker_state` | gauge | — | 0 closed, 1 half-open, 2 open |
-| `nexau_bifrost_breaker_trips_total` | counter | `reason` = consecutive \| rate \| half_open_probe | every transition to OPEN |
-| `nexau_bifrost_breaker_rejected_total` | counter | `state` | every fast-failed call |
+| `mash_upstream_breaker_state` | gauge | — | 0 closed, 1 half-open, 2 open |
+| `mash_upstream_breaker_trips_total` | counter | `reason` = consecutive \| rate \| half_open_probe | every transition to OPEN |
+| `mash_upstream_breaker_rejected_total` | counter | `state` | every fast-failed call |
 
 Ops alerting suggestion: page on `trips_total` rate > 0 sustained 5 min, or on
 `rejected_total` rate exceeding a fraction of run traffic. The state is also
 human-visible on `GET /health/ready`:
 
 ```json
-{ "status": "ok", "dependencies": [...], "bifrost_circuit": "open", "time": "..." }
+{ "status": "ok", "dependencies": [...], "upstream_circuit": "open", "time": "..." }
 ```
 
 ## 6. Client-visible contract (desktop team)
 
 | Surface | Behavior while OPEN |
 |---|---|
-| `POST /v1/agent/sessions/{id}/runs` (SSE) | HTTP 200 stream ends with `RUN_ERROR` event: `code=UPSTREAM_CIRCUIT_OPEN` |
+| ~~`POST /v1/agent/sessions/{id}/runs` (SSE)~~ route removed | (obsolete — the agent surface lives on the desktop now) |
 | WS `run.create` | `RUN_ERROR` envelope with the same code |
-| OpenAI-compat `POST /v1/agent/chat/completions` | HTTP 503, body `error.code=UPSTREAM_CIRCUIT_OPEN`, `error.details.retry_after_ms` |
+| OpenAI-compat `POST /v1/chat/completions` | HTTP 503, body `error.code=UPSTREAM_CIRCUIT_OPEN`, `error.details.retry_after_ms` |
 | Auth, sessions, replay, `/health/*` | **unaffected** |
 
 `retry_after_ms` is the remaining cooldown at rejection time — a safe
@@ -141,25 +143,26 @@ no user-facing error flow beyond the normal retry.
 
 | Env | Default | Notes |
 |---|---|---|
-| `NEXAU_BIFROST_CB_ENABLED` | `true` | master switch (zero-value config = disabled for tests) |
-| `NEXAU_BIFROST_CB_CONSECUTIVE` | `10` | consecutive trip threshold |
-| `NEXAU_BIFROST_CB_WINDOW` | `60` | rate window (outcomes) |
-| `NEXAU_BIFROST_CB_MIN_SAMPLES` | `30` | rate trip minimum samples |
-| `NEXAU_BIFROST_CB_FAILURE_RATE` | `0.60` | rate trip fraction |
-| `NEXAU_BIFROST_CB_OPEN_BASE` | `30s` | first cooldown |
-| `NEXAU_BIFROST_CB_OPEN_MAX` | `5m` | cooldown cap (exponential growth) |
-| `NEXAU_BIFROST_CB_HALFOPEN_PROBES` | `3` | concurrent recovery probes |
+| `NEXAU_OPENROUTER_CB_ENABLED` | `true` | master switch (zero-value config = disabled for tests) |
+| `NEXAU_OPENROUTER_CB_CONSECUTIVE` | `10` | consecutive trip threshold |
+| `NEXAU_OPENROUTER_CB_WINDOW` | `60` | rate window (outcomes) |
+| `NEXAU_OPENROUTER_CB_MIN_SAMPLES` | `30` | rate trip minimum samples |
+| `NEXAU_OPENROUTER_CB_FAILURE_RATE` | `0.60` | rate trip fraction |
+| `NEXAU_OPENROUTER_CB_OPEN_BASE` | `30s` | first cooldown |
+| `NEXAU_OPENROUTER_CB_OPEN_MAX` | `5m` | cooldown cap (exponential growth) |
+| `NEXAU_OPENROUTER_CB_HALFOPEN_PROBES` | `3` | concurrent recovery probes |
 
 Defaults reasoning: with 2 pre-first-byte retries, 10 consecutive *attempts*
 ≈ 3–4 fully failing requests from one replica — quick enough to protect the
-gateway, tolerant enough not to trip on one bad pod behind the VIP. The 60%
+upstream, tolerant enough not to trip on one bad edge node behind OpenRouter's
+anycast VIP. The 60%
 rate over 60 outcomes catches flapping within roughly a minute of traffic.
 Tighten (`CB_CONSECUTIVE=5`) for aggressive protection; loosen for brownouts
 with high variance.
 
 ## 8. Test evidence
 
-**Unit + client integration** (`internal/bifrost/breaker_test.go`, 22 tests,
+**Unit + client integration** (`internal/openrouter/breaker_test.go`, 22 tests,
 all under `-race`): disabled-never-opens; consecutive trip; success-resets
 streak; rate trip (incl. min-samples boundary, and the rule that only
 failings evaluate the rate); open fast-fail with cooldown hint; half-open
@@ -191,10 +194,11 @@ integration.
 * Per-replica state — no cross-replica coordination. During a trip, other
   replicas keep probing independently. This is standard (Envoy, Hystrix) and
   desirable: one replica's bad connection pool doesn't trip everyone.
-* No per-provider or per-model scoping — Bifrost is one logical upstream;
-  provider-level failover is Bifrost's own job (its `fallbacks` field).
+* No per-provider or per-model scoping — OpenRouter is one logical upstream;
+  provider-level failover is OpenRouter's own job (its routing and the
+  request-level `models` fallback list).
 * The `429`-as-success choice means the breaker does not protect against
-  being throttled — that is the rate limiter's and Bifrost's concern, and
+  being throttled — that is the rate limiter's and OpenRouter's concern, and
   Retry-After pacing already exists in the retry policy.
 * In-flight calls that started before a trip are allowed to complete; the
   bound is the existing retry/timeouts (≤ ~30–35 s worst case), not the

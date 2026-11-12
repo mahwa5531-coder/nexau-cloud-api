@@ -1,19 +1,19 @@
-package bifrost
+package openrouter
 
 import "encoding/json"
 
-// ChatRequest is the request body for Bifrost's chat-completions endpoint.
-// Field set mirrors the verified Bifrost OpenAPI ChatCompletionRequest:
-// model is "provider/model"; messages are OpenAI-style; Bifrost extensions
-// (fallbacks, reasoning) included. Unknown fields are preserved via Extras
-// so the desktop can pass provider-specific parameters without the gateway
-// needing a release.
+// ChatRequest is the request body for OpenRouter's chat-completions
+// endpoint (POST {base}/v1/chat/completions). Field set mirrors the
+// documented OpenRouter ChatRequest: model is a "vendor/model" slug;
+// messages are OpenAI-style; models is OpenRouter's ordered model-fallback
+// list. Unknown fields are preserved via Extras so the desktop can pass
+// provider-specific parameters (provider preferences, session_id, …)
+// without the gateway needing a release.
 type ChatRequest struct {
 	Model               string             `json:"model"`
 	Messages            []Message          `json:"messages"`
 	Stream              bool               `json:"stream,omitempty"`
-	StreamOptions       *StreamOptions     `json:"stream_options,omitempty"`
-	Fallbacks           []string           `json:"fallbacks,omitempty"`
+	Models              []string           `json:"models,omitempty"` // ordered fallback models (after the primary)
 	Temperature         *float64           `json:"temperature,omitempty"`
 	TopP                *float64           `json:"top_p,omitempty"`
 	MaxCompletionTokens *int64             `json:"max_completion_tokens,omitempty"`
@@ -98,12 +98,7 @@ type FunctionDef struct {
 	Strict      *bool           `json:"strict,omitempty"`
 }
 
-// StreamOptions mirrors Bifrost's ChatStreamOptions.
-type StreamOptions struct {
-	IncludeUsage bool `json:"include_usage,omitempty"`
-}
-
-// Reasoning mirrors Bifrost's ChatReasoning.
+// Reasoning mirrors OpenRouter's reasoning control (subset we forward).
 type Reasoning struct {
 	Effort    string `json:"effort,omitempty"` // none|minimal|low|medium|high|xhigh
 	MaxTokens *int64 `json:"max_tokens,omitempty"`
@@ -114,14 +109,31 @@ type Reasoning struct {
 // ---------------------------------------------------------------------------
 
 // ChatResponse is a non-stream completion result.
+//
+// A 200-OK body may still carry an error object (OpenRouter commits the
+// response before the provider fails): IsError() detects that shape, and
+// the client surfaces it instead of returning an empty completion.
 type ChatResponse struct {
-	ID          string       `json:"id"`
-	Object      string       `json:"object"`
-	Created     int64        `json:"created"`
-	Model       string       `json:"model"`
-	Choices     []RespChoice `json:"choices"`
-	Usage       *Usage       `json:"usage,omitempty"`
-	ExtraFields *ExtraFields `json:"extra_fields,omitempty"`
+	ID       string       `json:"id"`
+	Object   string       `json:"object"`
+	Created  int64        `json:"created"`
+	Model    string       `json:"model"`
+	Provider string       `json:"provider,omitempty"`
+	Choices  []RespChoice `json:"choices"`
+	Usage    *Usage       `json:"usage,omitempty"`
+	Error    *ErrorField  `json:"error,omitempty"`
+
+	// Raw is the verbatim upstream JSON body (audit M10). The tunnel's
+	// contract is verbatim passthrough: unknown upstream fields must
+	// survive non-streaming calls exactly as they survive streaming
+	// ones. Decoding into this struct serves validation and metering;
+	// the client answer is Raw, never a re-marshal of the struct.
+	Raw []byte `json:"-"`
+}
+
+// IsError reports whether the body carries an error payload.
+func (c *ChatResponse) IsError() bool {
+	return c.Error != nil && (c.Error.Message != "" || len(c.Error.Code) > 0)
 }
 
 // RespChoice is a completion choice (message for non-stream).
@@ -140,31 +152,30 @@ type ChatMessage struct {
 	ToolCalls []MessageToolCall `json:"tool_calls,omitempty"`
 }
 
-// ChatChunk is one SSE data payload of a streaming completion. Bifrost
-// standardizes: finish_reason and usage appear in the LAST chunk only.
-// A 200-OK stream may also carry an in-band BifrostError payload (verified
-// from the Bifrost spec: mid-stream provider failures are surfaced this way),
-// which IsError() detects.
+// ChatChunk is one SSE data payload of a streaming completion. OpenRouter
+// standardization: usage (with cost, is_byok and cost_details) arrives in
+// the final chunk, just before [DONE]; that terminal chunk also repeats the
+// finish_reason on a content-free delta — it is an accounting frame, not a
+// second terminal event. A 200-OK stream may also carry a top-level error
+// object (mid-stream provider failures after the response is committed,
+// terminal finish_reason "error"), which IsError() detects.
 type ChatChunk struct {
-	ID          string        `json:"id"`
-	Object      string        `json:"object"`
-	Created     int64         `json:"created"`
-	Model       string        `json:"model"`
-	Choices     []ChunkChoice `json:"choices"`
-	Usage       *Usage        `json:"usage,omitempty"`
-	ExtraFields *ExtraFields  `json:"extra_fields,omitempty"`
+	ID       string        `json:"id"`
+	Object   string        `json:"object"`
+	Created  int64         `json:"created"`
+	Model    string        `json:"model"`
+	Provider string        `json:"provider,omitempty"`
+	Choices  []ChunkChoice `json:"choices"`
+	Usage    *Usage        `json:"usage,omitempty"`
 
-	// In-band BifrostError fields (present only on error chunks).
-	Type           string      `json:"type,omitempty"`
-	IsBifrostError bool        `json:"is_bifrost_error,omitempty"`
-	StatusCode     int         `json:"status_code,omitempty"`
-	Error          *ErrorField `json:"error,omitempty"`
+	// In-band error payload (present only on error chunks; OpenRouter
+	// sends the error at the TOP LEVEL of the chunk with a numeric code).
+	Error *ErrorField `json:"error,omitempty"`
 }
 
 // IsError reports whether this chunk carries an in-band upstream error.
 func (c *ChatChunk) IsError() bool {
-	return c.IsBifrostError || (c.Error != nil &&
-		(c.Error.Message != "" || c.Error.Code != "" || c.Error.Type != ""))
+	return c.Error != nil && (c.Error.Message != "" || len(c.Error.Code) > 0)
 }
 
 // ChunkChoice is the streaming choice with a delta.
@@ -211,24 +222,48 @@ type FunctionDelta struct {
 	Arguments string `json:"arguments,omitempty"`
 }
 
-// Usage is BifrostLLMUsage — the authoritative token accounting.
+// Usage is OpenRouter's authoritative token/cost accounting. It rides the
+// final stream chunk and every non-streaming body, always.
 type Usage struct {
-	PromptTokens        int64                    `json:"prompt_tokens"`
-	CompletionTokens    int64                    `json:"completion_tokens"`
-	TotalTokens         int64                    `json:"total_tokens"`
-	PromptTokensDetails *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
-	CompletionDetails   *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
-	Cost                *Cost                    `json:"cost,omitempty"`
+	PromptTokens            int64                    `json:"prompt_tokens"`
+	CompletionTokens        int64                    `json:"completion_tokens"`
+	TotalTokens             int64                    `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	Cost                    *float64                 `json:"cost,omitempty"` // USD
+	IsByok                  *bool                    `json:"is_byok,omitempty"`
+	CostDetails             *CostDetails             `json:"cost_details,omitempty"`
 }
 
-// PromptTokensDetails breaks down input tokens.
+// PromptTokensDetails breaks down input tokens. CachedWriteTokens decodes
+// both documented spellings ("cache_write_tokens" — OpenRouter's — and
+// "cached_write_tokens").
 type PromptTokensDetails struct {
 	TextTokens        int64 `json:"text_tokens,omitempty"`
 	AudioTokens       int64 `json:"audio_tokens,omitempty"`
 	ImageTokens       int64 `json:"image_tokens,omitempty"`
-	CachedReadTokens  int64 `json:"cached_read_tokens,omitempty"`
-	CachedTokens      int64 `json:"cached_tokens,omitempty"`
+	CachedTokens      int64 `json:"cached_tokens,omitempty"`      // OpenRouter native
+	CachedReadTokens  int64 `json:"cached_read_tokens,omitempty"` // tolerated alias
 	CachedWriteTokens int64 `json:"cached_write_tokens,omitempty"`
+}
+
+// UnmarshalJSON additionally tolerates the "cache_write_tokens" spelling.
+func (p *PromptTokensDetails) UnmarshalJSON(data []byte) error {
+	type alias PromptTokensDetails
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*p = PromptTokensDetails(a)
+	if p.CachedWriteTokens == 0 {
+		var probe struct {
+			CacheWriteTokens int64 `json:"cache_write_tokens"`
+		}
+		if json.Unmarshal(data, &probe) == nil {
+			p.CachedWriteTokens = probe.CacheWriteTokens
+		}
+	}
+	return nil
 }
 
 // CompletionTokensDetails breaks down output tokens.
@@ -240,42 +275,12 @@ type CompletionTokensDetails struct {
 	RejectedPredictionTokens int64 `json:"rejected_prediction_tokens,omitempty"`
 }
 
-// Cost is Bifrost's cost breakdown.
-type Cost struct {
-	InputTokensCost  float64 `json:"input_tokens_cost,omitempty"`
-	OutputTokensCost float64 `json:"output_tokens_cost,omitempty"`
-	RequestCost      float64 `json:"request_cost,omitempty"`
-	TotalCost        float64 `json:"total_cost,omitempty"`
-}
-
-// ExtraFields is Bifrost's per-response metadata.
-type ExtraFields struct {
-	RequestType     string `json:"request_type,omitempty"`
-	Provider        string `json:"provider,omitempty"`
-	ModelRequested  string `json:"model_requested,omitempty"`
-	ModelDeployment string `json:"model_deployment,omitempty"`
-	// Newer Bifrost builds (2026) renamed the resolved-model metadata:
-	// original_model_requested (what the client asked for) and
-	// resolved_model_used (what actually served, after routing/fallbacks).
-	// Live-run against real maximhq/bifrost main 2026-09-27 (finding L1):
-	// both field sets are tolerated; ResolvedModel() prefers either.
-	OriginalModelRequested string `json:"original_model_requested,omitempty"`
-	ResolvedModelUsed      string `json:"resolved_model_used,omitempty"`
-	Latency                int64  `json:"latency,omitempty"` // milliseconds
-	ChunkIndex             int    `json:"chunk_index,omitempty"`
-}
-
-// ResolvedModel returns the model that actually served the request,
-// tolerating both the legacy (model_deployment) and current
-// (resolved_model_used) Bifrost field names.
-func (e *ExtraFields) ResolvedModel() string {
-	if e == nil {
-		return ""
-	}
-	if e.ModelDeployment != "" {
-		return e.ModelDeployment
-	}
-	return e.ResolvedModelUsed
+// CostDetails is OpenRouter's cost breakdown (USD).
+type CostDetails struct {
+	UpstreamInferencePromptCost      float64  `json:"upstream_inference_prompt_cost"`
+	UpstreamInferenceCompletionsCost float64  `json:"upstream_inference_completions_cost"`
+	UpstreamInferenceCost            *float64 `json:"upstream_inference_cost,omitempty"`
+	ServerToolCost                   *float64 `json:"server_tool_cost,omitempty"`
 }
 
 // ReasoningText returns the effective reasoning delta text across the

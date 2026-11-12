@@ -22,6 +22,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -113,7 +114,7 @@ func (a *API) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request) 
 
 	fail := func(de *domain.Error) {
 		if a.cfg.Auth.WebLoginURL != "" {
-			http.Redirect(w, r, a.cfg.Auth.WebLoginURL+"?error="+de.Code, http.StatusFound)
+			http.Redirect(w, r, appendQuery(a.cfg.Auth.WebLoginURL, "error", de.Code), http.StatusFound)
 			return
 		}
 		writeError(w, r, de)
@@ -136,7 +137,7 @@ func (a *API) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request) 
 		fail(domain.AsError(err))
 		return
 	}
-	http.Redirect(w, r, a.cfg.Auth.WebSuccessURL+"?grant="+grant, http.StatusFound)
+	http.Redirect(w, r, appendQuery(a.cfg.Auth.WebSuccessURL, "grant", grant), http.StatusFound)
 }
 
 // handleWebSession: POST /v1/auth/web/session {grant}
@@ -239,4 +240,18 @@ func (a *API) handleDesktopExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, pair)
+}
+
+// appendQuery adds one query parameter with proper URL parsing (audit L13):
+// naive string concatenation broke on values already carrying their own
+// query string and produced attacker-shaped redirects from pasted config.
+func appendQuery(base, key, value string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	q := u.Query()
+	q.Set(key, value)
+	u.RawQuery = q.Encode()
+	return u.String()
 }

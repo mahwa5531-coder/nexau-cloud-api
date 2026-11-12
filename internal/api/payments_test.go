@@ -257,6 +257,9 @@ func (f *apiFakeStore) ListOpenOrders(_ context.Context, limit int) ([]*payment.
 	}
 	return out, nil
 }
+func (f *apiFakeStore) ListRecentlyExpired(_ context.Context, within time.Duration, limit int) ([]*payment.Order, error) {
+	return nil, nil // unused by the API-layer tests
+}
 
 // stubRedirectProvider — a phonepe-shaped provider for route-level wire
 // tests (redirect_url relay + X-VERIFY webhook + mTxn id translation).

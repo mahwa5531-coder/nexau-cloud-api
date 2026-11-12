@@ -1,8 +1,8 @@
 # Deployment Runbook — NexaU Cloud API
 
 Everything needed to go from a clean checkout to a running, verified
-deployment. Three infrastructure dependencies (PostgreSQL, Redis, Bifrost),
-one binary, migrations run automatically at boot.
+deployment. Two infrastructure dependencies (PostgreSQL, Redis) plus one
+external API (OpenRouter), one binary, migrations run automatically at boot.
 
 ## 1. Prerequisites
 
@@ -10,7 +10,6 @@ one binary, migrations run automatically at boot.
 |---|---|---|
 | PostgreSQL | 15+ | schema + credit ledger; `pgx` pure-Go driver, no extensions |
 | Redis | 6+ | rate limiting, idempotency, streaming fan-out, replay |
-| Bifrost | any | the LLM gateway this API fronts; needs an API key |
 | Go | 1.25+ | only for bare-metal builds (Docker path needs nothing) |
 
 ## 2. Environment — what you MUST add
@@ -23,8 +22,9 @@ defaults (all ~100 keys are documented inline in `.env.example`):
 ```bash
 NEXAU_DATABASE_URL=postgres://mash:PASSWORD@postgres:5432/mash?sslmode=require
 NEXAU_REDIS_URL=redis://redis:6379/0
-NEXAU_BIFROST_URL=http://bifrost:8081
-NEXAU_BIFROST_API_KEY=<key from your Bifrost deployment>
+NEXAU_OPENROUTER_API_KEY=<key from https://openrouter.ai/keys>
+# NEXAU_OPENROUTER_URL defaults to https://openrouter.ai/api — set only for
+# testing against a mock upstream.
 
 # local auth mode (this API mints its own JWTs):
 NEXAU_AUTH_HS256_SECRET=$(openssl rand -hex 32)   # >= 32 bytes, secret-file variant available
@@ -79,8 +79,9 @@ docker compose up -d --build
 docker compose logs -f api # migrations run automatically at boot
 ```
 
-Brings up: `postgres`, `redis`, `bifrost`, `api` (all on one network;
-the API waits for both datastores to answer health checks).
+Brings up: `postgres`, `redis`, `api` (all on one network; the API waits
+for both datastores to answer health checks). The LLM upstream is
+OpenRouter over HTTPS — no gateway container.
 
 ### Bare metal
 
@@ -101,7 +102,7 @@ TOKEN=$(curl -s localhost:8080/v1/auth/login \
   -H 'Content-Type: application/json' \
   # (dev token: mint via the Google OAuth flow, or the mock provider in tests)
 
-# authed call through the full stack (api → bifrost)
+# authed call through the full stack (api → OpenRouter)
 curl -fsS localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}' | head -c 400

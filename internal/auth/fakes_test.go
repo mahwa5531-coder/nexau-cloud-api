@@ -133,10 +133,11 @@ func (m *memRefresh) ByHash(_ context.Context, tokenHash string) (*repos.Refresh
 	defer m.mu.Unlock()
 	for _, t := range m.byID {
 		if t.rt.TokenHash == tokenHash {
-			return &t.rt, nil
+			out := t.rt
+			return &out, nil
 		}
 	}
-	return nil, errMemRevoked
+	return nil, nil // SQL parity: not-found is (nil, nil)
 }
 
 func (m *memRefresh) RevokeFamily(_ context.Context, familyID, _ string) (int64, error) {
@@ -169,16 +170,33 @@ func (m *memRefresh) RevokeUser(_ context.Context, userID, _ string) (int64, err
 	return n, nil
 }
 
-func (m *memRefresh) LinkReplacement(_ context.Context, oldID, newID string) error {
+// Rotate mirrors the SQL single-transaction rotation: classify, consume+link
+// and insert the successor in one critical section (audit M14).
+func (m *memRefresh) Rotate(_ context.Context, tokenHash string, successor *repos.RefreshToken) (*repos.RefreshToken, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if t, ok := m.byID[oldID]; ok && t.rt.RevokedAt == nil {
+	for _, t := range m.byID {
+		if t.rt.TokenHash != tokenHash {
+			continue
+		}
+		switch {
+		case t.rt.RevokedAt != nil:
+			return nil, repos.ReuseSignal("revoked")
+		case t.rt.UsedAt != nil:
+			return nil, repos.ReuseSignal("used")
+		case !t.rt.ExpiresAt.After(time.Now()):
+			return nil, repos.ReuseSignal("expired")
+		}
 		now := time.Now()
+		t.rt.UsedAt = &now
 		t.rt.RevokedAt = &now
 		t.rt.RevokedReason = "rotation"
-		t.rt.ReplacedBy = newID
+		t.rt.ReplacedBy = successor.ID
+		m.byID[successor.ID] = &memRefreshToken{rt: *successor}
+		out := t.rt
+		return &out, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // seedMembership wires a user to a tenant (test setup helper).

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/mash-cloud/mash-api/internal/domain"
+	"github.com/mash-cloud/mash-api/internal/observability"
+	"github.com/mash-cloud/mash-api/internal/reqctx"
 )
 
 type ctxKey int
@@ -56,8 +58,24 @@ type Middleware struct {
 
 // Require authenticates the request: Bearer token → claims → identity.
 // It enforces server-side resolution of user/tenant/subscription state and
-// fails closed on infrastructure errors.
+// fails closed on infrastructure errors. Both session classes (device "api"
+// and browser "web") are admitted — use RequireDevice on routes a browser
+// session must never reach (audit M3).
 func (m Middleware) Require(next http.Handler) http.Handler {
+	return m.require(next, false)
+}
+
+// RequireDevice authenticates AND enforces the session class (audit M3):
+// browser web-session tokens (scp="web") are refused with 403. The web
+// sign-in exists to render a profile and run the payment flow; it is not an
+// API credential. Before this split, a web token was scope-identical to a
+// desktop token — any XSS on the web origin was full LLM-spend + payments
+// access.
+func (m Middleware) RequireDevice(next http.Handler) http.Handler {
+	return m.require(next, true)
+}
+
+func (m Middleware) require(next http.Handler, deviceOnly bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" {
@@ -70,6 +88,14 @@ func (m Middleware) Require(next http.Handler) http.Handler {
 		cancel()
 		if err != nil {
 			writeDomainError(w, classifyToDomain(err), r)
+			return
+		}
+
+		// Session-class gate (audit M3). The legacy empty scope (tokens minted
+		// before the split) stays full-access so rolling deploys do not log
+		// desktop clients out mid-session.
+		if deviceOnly && claims.Scope == "web" {
+			writeDomainError(w, domain.ErrForbidden("This route requires a desktop session."), r)
 			return
 		}
 
@@ -140,7 +166,18 @@ func asErrTokenClass(err error, target *ErrTokenClass) bool {
 
 func writeDomainError(w http.ResponseWriter, de *domain.Error, r *http.Request) {
 	if de.HTTP >= 500 {
-		// internal details to logs only; the writer adds request ids upstream
+		// Audit L9 completion (empty if-block): internal failures are logged
+		// server-side with their cause — the client body never carries it, so
+		// this line is the ONLY forensic record of why a 5xx left the building.
+		attrs := []any{
+			"code", de.Code,
+			"message", de.Message,
+			"request_id", reqctx.RequestID(r.Context()),
+		}
+		if de.Cause != nil {
+			attrs = append(attrs, "cause", de.Cause.Error())
+		}
+		observability.LogError("http 5xx domain error", attrs...)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(de.HTTP)

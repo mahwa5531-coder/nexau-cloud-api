@@ -11,12 +11,13 @@ package ratelimit
 
 import (
 	"context"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/mash-cloud/mash-api/internal/ids"
 	"github.com/mash-cloud/mash-api/internal/observability"
 	"github.com/mash-cloud/mash-api/internal/store"
 )
@@ -107,7 +108,73 @@ func (l *Limiter) AllowAll(ctx context.Context, member string, scopes ...Scope) 
 	return verdict
 }
 
+// AllowScopes runs the same pipelined admission as AllowAll but also returns
+// the PER-SCOPE verdicts (aligned with the returned active scope list) so
+// callers can report each dimension independently — e.g. the X-Ratelimit-*
+// response headers need the user scope's own limit/remaining, not a merged
+// minimum. Admission semantics are identical to AllowAll (same script, same
+// single round trip, same degradation policy): use Merged for the decision
+// and Verdicts/Active only for reporting.
+type AllowScopesResult struct {
+	Verdicts []Verdict // per-scope outcomes, aligned with Active
+	Active   []Scope   // the scopes actually checked (limit > 0, key set)
+	Merged   Verdict   // the admission decision — identical to AllowAll's return
+}
+
+func (l *Limiter) AllowScopes(ctx context.Context, member string, scopes ...Scope) AllowScopesResult {
+	res := l.allowScopesDetail(ctx, member, scopes)
+	if res.needLoad {
+		// Pipelined EVALSHA cannot fall back to EVAL (errors surface only
+		// after Exec), so the script is loaded explicitly and the batch retried.
+		if err := slidingWindowLua.Load(ctx, l.rdb).Err(); err == nil {
+			res = l.allowScopesDetail(ctx, member, scopes)
+		}
+	}
+	if res.down {
+		return AllowScopesResult{Merged: l.degraded()}
+	}
+	return AllowScopesResult{Verdicts: res.verdicts, Active: res.active, Merged: mergeVerdicts(res.verdicts, res.active)}
+}
+
+// allowAll merges per-scope verdicts into the strictest single verdict,
+// preserving the degradation policy on Redis loss.
 func (l *Limiter) allowAll(ctx context.Context, member string, scopes []Scope) (Verdict, bool) {
+	r := l.allowScopesDetail(ctx, member, scopes)
+	if r.needLoad {
+		return Verdict{Allowed: true}, true
+	}
+	if r.down {
+		return l.degraded(), false
+	}
+	return mergeVerdicts(r.verdicts, r.active), false
+}
+
+func mergeVerdicts(verdicts []Verdict, active []Scope) Verdict {
+	verdict := Verdict{Allowed: true}
+	for i, v := range verdicts {
+		if !v.Allowed {
+			if i < len(active) {
+				v.Limit = active[i].Limit
+			}
+			return v
+		}
+		if v.Remaining < verdict.Remaining || i == 0 {
+			verdict.Remaining = v.Remaining
+		}
+	}
+	return verdict
+}
+
+type scopesRun struct {
+	verdicts []Verdict
+	active   []Scope
+	needLoad bool
+	down     bool
+}
+
+// allowScopesDetail pipelines one slidingWindowLua call per active scope and
+// keeps the per-scope results.
+func (l *Limiter) allowScopesDetail(ctx context.Context, member string, scopes []Scope) scopesRun {
 	active := make([]Scope, 0, len(scopes))
 	for _, s := range scopes {
 		if s.Limit > 0 && s.Key != "" {
@@ -115,7 +182,7 @@ func (l *Limiter) allowAll(ctx context.Context, member string, scopes []Scope) (
 		}
 	}
 	if len(active) == 0 {
-		return Verdict{Allowed: true}, false
+		return scopesRun{active: active}
 	}
 
 	now := time.Now().UnixMilli()
@@ -126,34 +193,32 @@ func (l *Limiter) allowAll(ctx context.Context, member string, scopes []Scope) (
 			now, s.Window.Milliseconds(), s.Limit, member))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && !isScriptCmdErr(cmds) {
-		return l.degraded(), false
+		return scopesRun{active: active, down: true}
 	}
 
-	verdict := Verdict{Allowed: true}
+	verdicts := make([]Verdict, 0, len(active))
 	needLoad := false
 	for i, cmd := range cmds {
 		res, err := cmd.Result()
 		if err != nil {
 			if isNoScriptErr(err) {
 				needLoad = true
+				verdicts = append(verdicts, Verdict{Allowed: true})
 				continue
 			}
 			if isRedisDownErr(err) {
-				return l.degraded(), false
+				return scopesRun{active: active, down: true}
 			}
-			continue // single-scope script fault: be lenient on that scope
+			verdicts = append(verdicts, Verdict{Allowed: true}) // single-scope script fault: be lenient on that scope
+			continue
 		}
 		v := parseVerdict(res)
-		if !v.Allowed {
+		if !v.Allowed && i < len(active) {
 			v.Limit = active[i].Limit
-			verdict = v
-			break
 		}
-		if v.Remaining < verdict.Remaining || i == 0 {
-			verdict.Remaining = v.Remaining
-		}
+		verdicts = append(verdicts, v)
 	}
-	return verdict, needLoad
+	return scopesRun{verdicts: verdicts, active: active, needLoad: needLoad}
 }
 
 // isNoScriptErr detects the NOSCRIPT server reply (pipeline path).
@@ -277,61 +342,103 @@ func (l *Limiter) Hit(ctx context.Context, key string, window time.Duration, mem
 }
 
 // --- concurrency slots ------------------------------------------------------
+//
+// Design (audit H1, root fix): each dimension is a ZSET whose members are
+// individual slot holders, scored with the slot's expiry instant (server
+// time, from Redis TIME). Acquisition prunes expired holders, counts, and
+// adds a fresh holder in one atomic script.
+//
+// Why per-holder expiry beats the old shared counter: the counter's key TTL
+// was refreshed by EVERY acquire/release, so under sustained traffic the key
+// never got a quiet TTL to expire — a slot leaked by a hard-killed pod (its
+// Release never ran) stayed booked forever, and the only documented cure
+// (Limiter.Reconcile) had zero production callers. With holders scored by
+// expiry, a leaked slot disappears exactly one SlotTTL after it was CLAIMED,
+// no matter how much other traffic touches the key. The key-level PEXPIRE is
+// a pure garbage-collection backstop for idle dimensions: it is always set to
+// ttl+1s at claim time, so it can never evict a live holder early.
 
-// acquireLua claims a concurrency slot iff below the limit. The TTL is the
-// crash-recovery backstop: a slot held by a dead instance self-expires.
-// KEYS[1]=counter  ARGV: limit, ttl_ms
-var acquireLua = redis.NewScript(`
-local cur = redis.call('GET', KEYS[1])
-if cur and tonumber(cur) >= tonumber(ARGV[1]) then
-        return 0
+// slotAcquireLua atomically prunes expired holders, enforces the limit, and
+// claims one slot for ARGV[4] (holder id). KEYS[1]=holder zset
+// ARGV: limit, now_ms, ttl_ms, holder — now_ms is caller-provided for the
+// same clock-skew posture as the sliding-window scripts.
+// Returns {1, holders_after_claim} on success, {0, holders_now} when full —
+// the active-holder count feeds the X-Ratelimit concurrency headers.
+var slotAcquireLua = redis.NewScript(`
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[2]))
+local n = redis.call('ZCARD', KEYS[1])
+if n >= tonumber(ARGV[1]) then
+        return {0, n}
 end
-redis.call('INCR', KEYS[1])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
-return 1
+redis.call('ZADD', KEYS[1], tonumber(ARGV[2]) + tonumber(ARGV[3]), ARGV[4])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]) + 1000)
+return {1, n + 1}
 `)
 
-// releaseLua returns a slot, floored at zero.
-// KEYS[1]=counter  ARGV: ttl_ms
-var releaseLua = redis.NewScript(`
-local cur = redis.call('GET', KEYS[1])
-if not cur or tonumber(cur) <= 0 then
-        return 0
-end
-local v = redis.call('DECR', KEYS[1])
-if v < 0 then
-        redis.call('SET', KEYS[1], 0)
-        v = 0
-end
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[1]))
-return v
+// slotReleaseLua returns exactly one holder's slot (idempotent).
+// KEYS[1]=holder zset  ARGV: holder
+var slotReleaseLua = redis.NewScript(`
+return redis.call('ZREM', KEYS[1], ARGV[1])
 `)
 
-// Acquire claims a concurrency slot (bounded in-flight runs).
-func (l *Limiter) Acquire(ctx context.Context, key string, limit int64, ttl time.Duration) bool {
-	if limit <= 0 {
-		return true // dimension disabled
-	}
-	res, err := acquireLua.Run(ctx, l.rdb, []string{key}, limit, ttl.Milliseconds()).Int()
-	if err != nil {
-		return l.degraded().Allowed
-	}
-	return res == 1
+// Slot is one claimed concurrency slot. Release is idempotent and safe to
+// call from any goroutine, including a deferred cleanup after the request
+// context has been cancelled (use a context.WithoutCancel wrapper there).
+// Active reports the holder count observed at claim time (including this
+// claim) — the transport surfaces it as X-Ratelimit-Remaining-Concurrency.
+type Slot struct {
+	lim    *Limiter
+	key    string
+	holder string
+	active int64
+	once   sync.Once
 }
 
-// Release returns a slot. Best-effort: failures only skew the counter until the
-// TTL backstop or reconciliation corrects it.
-func (l *Limiter) Release(ctx context.Context, key string, ttl time.Duration) {
-	if l.rdb == nil {
+// Release returns the slot. Best-effort: a failed release only costs the
+// holder its slot until the per-holder expiry reclaims it (bounded leak).
+func (s *Slot) Release(ctx context.Context) {
+	if s == nil {
 		return
 	}
-	_, _ = releaseLua.Run(ctx, l.rdb, []string{key}, ttl.Milliseconds()).Int()
+	s.once.Do(func() {
+		_, _ = slotReleaseLua.Run(ctx, s.lim.rdb, []string{s.key}, s.holder).Int()
+	})
 }
 
-// Reconcile resets a counter to the authoritative value (PostgreSQL count).
-// Called by the background sweeper to erase leaked slots.
-func (l *Limiter) Reconcile(ctx context.Context, key string, value int64, ttl time.Duration) {
-	_, _ = l.rdb.Set(ctx, key, strconv.FormatInt(value, 10), ttl).Result()
+// Active reports the holder count observed at claim time (this claim
+// included); 0 when the claim happened in a fail-open window.
+func (s *Slot) Active() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.active
+}
+
+// AcquireSlot claims one concurrency slot (bounded in-flight runs) and
+// returns the handle used to release it. The second return is false when the
+// dimension is at its limit. Fail-open on Redis loss, mirroring the limiter's
+// posture; in that case the returned Slot is nil (nothing to release).
+func (l *Limiter) AcquireSlot(ctx context.Context, key string, limit int64, ttl time.Duration) (*Slot, bool) {
+	if limit <= 0 {
+		return nil, true // dimension disabled — admitted, nothing to hold
+	}
+	holder := ids.New("slot")
+	res, err := slotAcquireLua.Run(ctx, l.rdb, []string{key},
+		limit, time.Now().UnixMilli(), ttl.Milliseconds(), holder).Slice()
+	if err != nil || len(res) < 1 {
+		return nil, l.degraded().Allowed
+	}
+	allowed, _ := res[0].(int64)
+	if allowed != 1 {
+		return nil, false
+	}
+	s := &Slot{lim: l, key: key, holder: holder, active: 1}
+	if len(res) > 1 {
+		if n, ok := res[1].(int64); ok {
+			s.active = n
+		}
+	}
+	return s, true
 }
 
 // --- client IP extraction ---------------------------------------------------

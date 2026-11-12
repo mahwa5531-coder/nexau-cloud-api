@@ -77,4 +77,11 @@ type Store interface {
 	// ListOpenOrders returns non-terminal orders (bounded; oldest first —
 	// the sweeper re-checks these for missed captures).
 	ListOpenOrders(ctx context.Context, limit int) ([]*Order, error)
+
+	// ListRecentlyExpired returns orders that expired within the given
+	// window (bounded; oldest first). Late provider captures can land after
+	// our TTL flipped the order to expired — the sweep re-checks these too
+	// (audit H5: money leaving the bank with no webhook and no browser
+	// return must still converge to 'paid').
+	ListRecentlyExpired(ctx context.Context, within time.Duration, limit int) ([]*Order, error)
 }

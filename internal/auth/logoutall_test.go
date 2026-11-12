@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -26,13 +27,15 @@ func TestLogoutAllRevokesEveryFamily(t *testing.T) {
 	}
 
 	// Two independent login families for usr_victim + one for usr_other.
+	var seq int
 	issue := func(userID string) string {
 		t.Helper()
+		seq++
 		rt := &repos.RefreshToken{
-			ID:     "rt_" + userID + "_" + time.Now().Format("150405.000000000"),
-			UserID: userID, TenantID: "ten_1", FamilyID: "fam_" + userID +
-				"_" + time.Now().Format("150405.000000000"),
-			TokenHash: HashToken("secret-" + userID + "-" + time.Now().String()),
+			ID:     fmt.Sprintf("rt_%s_%s_%d", userID, time.Now().Format("150405.000000000"), seq),
+			UserID: userID, TenantID: "ten_1",
+			FamilyID: fmt.Sprintf("fam_%s_%s_%d", userID, time.Now().Format("150405.000000000"), seq),
+			TokenHash: HashToken(fmt.Sprintf("secret-%s-%s-%d", userID, time.Now().String(), seq)),
 			ExpiresAt: time.Now().Add(time.Hour),
 		}
 		if err := refresh.Issue(context.Background(), rt); err != nil {

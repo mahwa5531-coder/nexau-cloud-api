@@ -8,7 +8,7 @@ things:
 1. **Identity** — Google OAuth only, via a web-to-desktop handshake
 2. **Entitlements** — plans (Free/Pro), quotas, rate limits
 3. **Billing** — plan subscriptions, plans only (PhonePe default; Razorpay/Stripe selectable): a captured purchase activates/extends Pro; no credit packs
-4. **The LLM tunnel** — `POST /v1/chat/completions` → private [Bifrost](https://github.com/maximhq/bifrost) gateway (SSE, verbatim passthrough, metered)
+4. **The LLM tunnel** — `POST /v1/chat/completions` → [OpenRouter](https://openrouter.ai) direct over HTTPS (SSE, verbatim passthrough, metered)
 
 Go monolith · PostgreSQL (Aiven) + Redis · one binary · stateless replicas.
 
@@ -19,7 +19,7 @@ cp .env.example .env
 # REQUIRED: NEXAU_AUTH_HS256_SECRET (openssl rand -hex 32)
 # Production: NEXAU_AUTH_GOOGLE_CLIENT_ID/SECRET/REDIRECT_URL + NEXAU_AUTH_WEB_SUCCESS_URL
 
-docker compose up -d          # postgres + redis + bifrost + api
+docker compose up -d          # postgres + redis + api
 docker compose logs -f api
 ```
 
@@ -43,7 +43,7 @@ data: {"id":"c1",...,"usage":{"prompt_tokens":10,...}}
 data: [DONE]
 ```
 
-OpenAI-compatible; models are `"provider/model"` (Bifrost routing). One
+OpenAI-compatible; models are `"vendor/model"` (OpenRouter slugs). One
 `llm_calls` row meters the call (tokens, cost, latency) — **message content is
 never persisted anywhere in the cloud**.
 
@@ -66,8 +66,8 @@ Full contract: `docs/DESKTOP-CONNECTION.md` and `docs/api.md`.
 cmd/server/        wiring + graceful shutdown + housekeeping
 internal/api/      HTTP surface (22 routes)
 internal/auth/     Google OAuth, handshake, refresh rotation, middleware
-internal/llm/      the proxy: validation → entitlement → quota → limits → Bifrost → SSE
-internal/bifrost/  upstream client: retries, circuit breaker, stream reader
+internal/llm/         the proxy: validation → entitlement → quota → limits → upstream → SSE
+internal/openrouter/  direct upstream client: retries, circuit breaker, stream reader
 internal/ratelimit/  Redis Lua sliding windows + concurrency slots
 internal/metering/   async llm_calls recorder (batch, exactly-once)
 internal/payment/    Razorpay credit top-ups (orders, ledger, webhook)
@@ -87,7 +87,7 @@ make lint      # fmt + vet + build
 make up        # local stack
 ```
 
-Tests need no infrastructure (miniredis + in-memory fakes + fake Bifrost);
+Tests need no infrastructure (miniredis + in-memory fakes + fake OpenRouter);
 the payments repo PG-integration suite opts in via `NEXAU_TEST_DATABASE_URL`.
 
 ## Documentation
@@ -100,13 +100,13 @@ the payments repo PG-integration suite opts in via `NEXAU_TEST_DATABASE_URL`.
 | `docs/PAYMENT-GATEWAY.md` | Razorpay + Stripe + PhonePe integration, exactly-once subscription activation |
 | `docs/FRONTEND-PAYMENTS.md` | the client-facing endpoint map + per-provider call sequences |
 | `docs/MODELS-AND-PRICING.md` | **launch decisions**: October-2026 model lineup, normalization weights, Free/Pro plans, Indian-market pricing, ZDR matrix |
-| `docs/CIRCUIT-BREAKER.md` | Bifrost-path breaker design |
+| `docs/CIRCUIT-BREAKER.md` | upstream-path breaker design |
 | `docs/DEPLOYMENT.md` | deployment + ops runbook |
 | `docs/CLEANUP-2026-10-05.md` | the simplification audit trail |
 
 ## Security posture
 
-- Provider keys live only in Bifrost; this API holds one Bifrost credential.
+- Provider keys live only in the OpenRouter account (BYOK, shared-capacity fallback off); this API holds one OpenRouter API key.
 - Tokens never cross the browser — only single-use 60-second codes do.
 - Identity is server-resolved per request; the anchor is Google's `sub`.
 - The HS256 secret is deployment-only; compose fails fast without it.
